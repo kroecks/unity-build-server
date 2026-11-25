@@ -105,6 +105,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </span>
     </div>
     <div id="state">idle</div>
+    <div class="logbar" id="fulllogwrap" style="display:none">
+      <span class="hint">showing recent lines only</span>
+      <button class="sec" id="fullLog">View full log</button>
+    </div>
     <pre id="log"></pre>
     <div class="logbar">
       <span id="logfollow">following live output</span>
@@ -344,18 +348,63 @@ async function startBuild(p) {
     setState(b.state); stream(b.id);
   } catch(e){ setState("failed: " + e.message); }
 }
+// Live view keeps only the most recent lines so the DOM text node never grows
+// unbounded (a huge node renders as blank gaps when you scroll a backgrounded
+// tab). The COMPLETE log is always on disk; "View full log" loads it verbatim.
+const LIVE_MAX_LINES = 1200;
+let liveLines = [];     // ring of recent lines for the current stream
+let pending = [];       // lines arrived since the last paint
+let flushScheduled = false;
+let truncatedCount = 0; // how many older lines we dropped from the live view
+
+function scheduleFlush() {
+  if (flushScheduled) return;
+  flushScheduled = true;
+  // requestAnimationFrame coalesces bursts; a backgrounded tab fires it on
+  // return, so we catch up in one paint instead of thousands of appends.
+  requestAnimationFrame(flushLog);
+}
+function flushLog() {
+  flushScheduled = false;
+  if (!pending.length) return;
+  const log = $("log");
+  const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+  liveLines.push(...pending); pending = [];
+  if (liveLines.length > LIVE_MAX_LINES) {
+    truncatedCount += liveLines.length - LIVE_MAX_LINES;
+    liveLines = liveLines.slice(-LIVE_MAX_LINES);
+  }
+  const header = truncatedCount
+    ? `… ${truncatedCount} earlier lines not shown — tap “View full log” below …\n\n` : "";
+  log.textContent = header + liveLines.join("\n") + "\n";
+  $("fulllogwrap").style.display = truncatedCount ? "block" : "none";
+  if (userFollowing && nearBottom) log.scrollTop = log.scrollHeight;
+}
+
 function stream(id) {
   if (es) es.close();
   currentBuildId = id; showStop(true);
+  liveLines = []; pending = []; truncatedCount = 0;
+  $("log").textContent = ""; $("fulllogwrap").style.display = "none";
   es = new EventSource(`/logs/${id}`);
-  const log = $("log"); setState("running");
-  es.onmessage = e => {
-    const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
-    log.textContent += e.data + "\n";
-    if (userFollowing && nearBottom) log.scrollTop = log.scrollHeight;
-  };
-  es.addEventListener("done", e => { setState(e.data); es.close(); showStop(false); refreshStatus(); });
+  setState("running");
+  es.onmessage = e => { pending.push(e.data); scheduleFlush(); };
+  es.addEventListener("done", e => {
+    flushLog(); setState(e.data); es.close(); showStop(false); refreshStatus();
+  });
   es.onerror = () => {};
+}
+// "View full log" loads the complete on-disk log for the current build.
+async function loadFullLog() {
+  if (!currentBuildId) return;
+  try {
+    const r = await fetch(`/logs/${currentBuildId}/raw`);
+    if (r.ok) {
+      $("log").textContent = await r.text();
+      truncatedCount = 0; $("fulllogwrap").style.display = "none";
+      $("log").scrollTop = $("log").scrollHeight;
+    }
+  } catch(e){ alert("Could not load full log: " + e.message); }
 }
 $("stopBuild").onclick = async () => {
   if (!currentBuildId) return;
@@ -383,12 +432,15 @@ $("jumpLatest").onclick = () => {
   userFollowing = true; $("jumpLatest").style.display="none";
   $("logfollow").textContent = "following live output";
 };
+$("fullLog").onclick = loadFullLog;
 $("closeBuild").onclick = () => { if (es) es.close(); $("buildCard").style.display="none"; };
 
 // Load a finished build's saved log (tapped from history), no live stream.
 async function viewLog(b) {
   if (es) es.close();
   currentBuildId = null; showStop(false);
+  pending = []; liveLines = []; truncatedCount = 0;
+  $("fulllogwrap").style.display = "none";   // finished log is loaded whole
   $("buildCard").style.display="block";
   $("buildTitle").textContent = b.project_name + " · " + b.created_iso;
   setState(b.state);
