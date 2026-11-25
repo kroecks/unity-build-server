@@ -1,0 +1,13 @@
+{
+  "build_script": "~/unity-build-server/scripts/build.sh",
+  "log_dir": "~/unity-build-server/logs",
+  "registry_path": "~/unity-build-server/config/projects.json",
+  "builds_root": "~/builds",
+  "browse_root": "~",
+
+  "output_root": "/Volumes/GameDev/ubs-output",
+  "keep_builds_per_project": 10,
+
+  "build_token": "CHANGE-ME-a-passphrase-or: openssl rand -hex 24",
+  "gitea_webhook_secret": "CHANGE-ME-matches-every-gitea-webhook-secret"
+}

@@ -1,0 +1,28 @@
+=== build 64b51b3619a5 | voxelmage_gitea | Tue Nov 24 17:34:01 2026 ===
+
+[1m>>> Syncing /Volumes/GameDev/voxelmage_gitea to origin/main[0m
+From http://terronas:3000/ken/voxelmage_gitea
+   5bd248e4d..0c91f73f2  main       -> origin/main
+Already on 'main'
+Your branch is behind 'origin/main' by 1 commit, and can be fast-forwarded.
+  (use "git pull" to update your local branch)
+HEAD is now at 0c91f73f2 remove empty folders
+0c91f73f2 remove empty folders
+
+[1m>>> Project targets Unity 6000.3.27f1[0m
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import sys,json; d=json.load(sys.stdin); sys.exit(0 if '6000.3.27f1' in [e.get('version') for e in d] else 1)
+                                                                             ^^^^^
+AttributeError: 'str' object has no attribute 'get'
+
+[1m>>> Unity 6000.3.27f1 not installed[0m
+
+[1m>>> Reclaiming disk: removing other editor versions[0m
+Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+    v=e.get('version')
+      ^^^^^
+AttributeError: 'str' object has no attribute 'get'
+
+=== finished rc=1 (failed) ===

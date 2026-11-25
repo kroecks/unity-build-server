@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ~/Library/LaunchAgents/com.local.unitybuild.plist
+     launchctl load ~/Library/LaunchAgents/com.local.unitybuild.plist
+     Runs as YOUR user (needed for Unity license, keychain signing, device install).
+     The mini should stay logged in and not locked for signing + install to work. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.local.unitybuild</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/uvicorn</string>
+    <string>app.server:app</string>
+    <string>--host</string>
+    <string>192.168.1.50</string>   <!-- the mini's LAN IP, NOT 0.0.0.0 -->
+    <string>--port</string>
+    <string>8712</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/YOURUSER/unity-build-server</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>UBS_CONFIG</key><string>/Users/YOURUSER/unity-build-server/config/config.json</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>UNITY_SERVICE_ACCOUNT_ID</key><string>CHANGE-ME</string>
+    <key>UNITY_SERVICE_ACCOUNT_SECRET</key><string>CHANGE-ME</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/YOURUSER/unity-build-server/logs/server.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOURUSER/unity-build-server/logs/server.err.log</string>
+</dict>
+</plist>

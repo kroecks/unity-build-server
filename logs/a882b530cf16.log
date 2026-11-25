@@ -1,0 +1,119 @@
+=== build a882b530cf16 | voxelmage_gitea | Tue Nov 24 17:19:43 2026 ===
+
+[1m>>> Syncing /Volumes/GameDev/voxelmage_gitea to origin/main[0m
+Already on 'main'
+Your branch is ahead of 'origin/main' by 1 commit.
+  (use "git push" to publish your local commits)
+HEAD is now at 5bd248e4d fix
+Removing Assets/AddressableAssetsData/Android/
+Removing Assets/AddressableAssetsData/Windows/
+Removing Assets/Art/Models/AnglerShip/ShipWreckModels/BlenderFile/
+Removing Assets/Editor/BuildScript.cs
+Removing Assets/Editor/x64/
+Removing Assets/GameData/AI/AIBrainStateCondition 1/
+Removing Assets/GameData/AI/AIControllerActionBase/AIActionClearAbility 1/
+Removing Assets/GameData/AI/AIControllerActionBase/AIActionSetVariable 1/
+Removing Assets/GameData/AI/AIControllerActionBase/AIControllerSetBrainState 1/
+Removing Assets/GameData/Audio/SongDefinition/
+Removing Assets/GameData/Characters/AI/AIControllerActionBase/
+Removing Assets/GameData/Definitions/AI/AIBrainStateCondition/AIBrainConditionHasParkingSpot 1/
+Removing Assets/GameData/Definitions/AI/AIBrainStateCondition/AIBrainConditionHasParkingSpot/
+Removing Assets/GameData/Definitions/AI/AIControllerActionBase 1/
+Removing Assets/GameData/Definitions/AI/AIControllerActionBase/AIBrainActionChooseTargetPosition 1/
+Removing Assets/GameData/Definitions/AI/AIControllerBase/AIBrainControllerChoosePosition/
+Removing Assets/GameData/Definitions/AI/AIControllerBase/AIDriveTowardsPosition/
+Removing Assets/GameData/Definitions/Abilities/AbilityEffect/AbilityEffectEffectPlayer/
+Removing Assets/GameData/Definitions/Abilities/CastingDefinition/CastingDefinition/
+Removing Assets/GameData/Definitions/Audio/AudioClipDefinition 1/
+Removing Assets/GameData/Definitions/Audio/AudioClipDefinition 10/
+Removing Assets/GameData/Definitions/Audio/AudioClipDefinition 2/
+Removing Assets/GameData/Definitions/Audio/AudioClipDefinition 3/
+Removing Assets/GameData/Definitions/Audio/AudioClipDefinition 4/
+Removing Assets/GameData/Definitions/Audio/AudioClipDefinition 5/
+Removing Assets/GameData/Definitions/Audio/AudioClipDefinition 6/
+Removing Assets/GameData/Definitions/Audio/AudioClipDefinition 7/
+Removing Assets/GameData/Definitions/Audio/AudioClipDefinition 8/
+Removing Assets/GameData/Definitions/Audio/AudioClipDefinition 9/
+Removing Assets/GameData/Definitions/Dialogue/Definitions/SpokenLineDefinition 1/
+Removing Assets/GameData/Definitions/Dialogue/Definitions/SpokenLineDefinition 10/
+Removing Assets/GameData/Definitions/Dialogue/Definitions/SpokenLineDefinition 2/
+Removing Assets/GameData/Definitions/Dialogue/Definitions/SpokenLineDefinition 3/
+Removing Assets/GameData/Definitions/Dialogue/Definitions/SpokenLineDefinition 4/
+Removing Assets/GameData/Definitions/Dialogue/Definitions/SpokenLineDefinition 5/
+Removing Assets/GameData/Definitions/Dialogue/Definitions/SpokenLineDefinition 6/
+Removing Assets/GameData/Definitions/Dialogue/Definitions/SpokenLineDefinition 7/
+Removing Assets/GameData/Definitions/Dialogue/Definitions/SpokenLineDefinition 8/
+Removing Assets/GameData/Definitions/Dialogue/Definitions/SpokenLineDefinition 9/
+Removing Assets/GameData/Definitions/Effects/EffectEventDefinition/
+Removing Assets/GameData/Definitions/GameMode/GameActionDefinition/GameActionSetAvailableEquipment/
+Removing Assets/GameData/Definitions/GameMode/GameActionDefinition/GameActionSpawnObject/
+Removing Assets/GameData/Definitions/Items/EquipmentUnlockConditionDefinition/LevelCompleteUnlockCondition/
+Removing Assets/GameData/Dialogue/Definitions/DialogueNodeDefinition/DialogueNodeRandomChoiceDefinition 1/
+Removing Assets/GameData/GameEvents/
+Removing Assets/GameData/GameMode/Definitions/CharacterSkinPalette 1/
+Removing Assets/GameData/GameMode/Definitions/GameActionDefinition/ConditionalGameActionDefinition/
+Removing Assets/GameData/GameMode/Definitions/GameActionDefinition/GameActionRespawnPlayers/
+Removing Assets/GameData/GameMode/Definitions/GameActionDefinition/GameActionRoundControl/
+Removing Assets/GameData/GameMode/Definitions/GameScoreProviderDefinition 1/
+Removing Assets/GameData/GameMode/Definitions/GameScoreProviderDefinition/EventDefinitionScoreProviderDefinition 1/
+Removing Assets/GameData/GameMode/Definitions/MatchRewardDefinition 1/
+Removing Assets/GameData/GameMode/Definitions/Score/GameScoreProviderDefinition/PlayerKillScoreProviderDefinition/
+Removing Assets/GameData/Gameplay/Ability 1/
+Removing Assets/GameData/Gameplay/Computer 1/
+Removing Assets/GameData/Gameplay/Definitions/ItemSelectionCriteriaDefinition 1/
+Removing Assets/GameData/Gameplay/Definitions/PlayerCustomizationStoreManifest 1/
+Removing Assets/GameData/Gameplay/Definitions/UnlockConditionDefinition/CompositeUnlockConditionDefinition 1/
+Removing Assets/GameData/Gameplay/Effects 1/
+Removing Assets/GameData/Gameplay/Projectile/ProjectileDrivingDefinition/LaunchedProjectileDrivingDefinition/
+Removing Assets/GameData/Gameplay/Projectile/ProjectileDrivingDefinition/MissileProjectileDriverDefinition 1/
+Removing Assets/GameData/IconGeneration 1/
+Removing Assets/GameData/Items 1/
+Removing Assets/GameData/Targeting/
+Removing Assets/Materials/
+Removing Assets/PlayAssetDelivery/DataBuilders/
+Removing Assets/PlayAssetDelivery/InitObjects/
+Removing Assets/Plugins/RootMotion/FinalIK/_Integration/
+Removing Assets/Samples/Universal RP/16.0.5/URP Package Samples/SharedAssets/VolumeProfiles/
+Removing Assets/Scenes/Levels/Bay/01_blasty_bay/
+Removing Assets/Scenes/Levels/Bay/01_blasty_bay_campaign/
+Removing Assets/Scenes/Levels/Bay/01_blasty_bay_targets/
+Removing Assets/Scenes/Levels/Bay/01_duel_bay/
+Removing Assets/Scenes/Levels/Bay/01_quad_bay/
+Removing Assets/Scenes/Levels/Bay/08_duel_bay/
+Removing Assets/Scenes/Levels/Tundra/03_towering_tundra/
+Removing Assets/Scripts/Chat/Definitions/
+Removing Assets/Scripts/DefinitionAudit/
+Removing Assets/Scripts/Definitions/DefinitionResolver/
+Removing Assets/Scripts/Infrastructure/ScriptableObjectArchitecture/Editor/
+Removing Assets/Scripts/UnityServices/Auth/
+Removing Assets/StreamingAssets/
+Removing Assets/TextMesh Pro/Fonts & Materials/
+Removing Assets/TextMesh Pro/Sprite Assets/
+Removing Assets/TextMesh Pro/Style Sheets/
+Removing Assets/ThirdParty/BOXOPHOBIC/Atmospheric Height Fog/Core/Pipelines/
+Removing Assets/ThirdParty/DynamicFog/Builtin/
+Removing Assets/ThirdParty/DynamicFog/URP/
+Removing Assets/ThirdParty/Epic Toon FX/Upgrade/Legacy/
+Removing Assets/ThirdParty/VolumetricFogBundle/Builtin/
+Removing Assets/ThirdParty/VolumetricFogBundle/URP/
+Removing Assets/ThirdParty/VolumetricLightsBundle/Builtin/
+Removing Assets/ThirdParty/VolumetricLightsBundle/URP/
+5bd248e4d fix
+
+[1m>>> Project targets Unity 6000.3.27f1[0m
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import sys,json; d=json.load(sys.stdin); sys.exit(0 if '6000.3.27f1' in [e.get('version') for e in d] else 1)
+                                                                             ^^^^^
+AttributeError: 'str' object has no attribute 'get'
+
+[1m>>> Unity 6000.3.27f1 not installed[0m
+
+[1m>>> Reclaiming disk: removing other editor versions[0m
+Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+    v=e.get('version')
+      ^^^^^
+AttributeError: 'str' object has no attribute 'get'
+
+=== finished rc=1 (failed) ===

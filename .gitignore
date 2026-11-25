@@ -1,0 +1,45 @@
+# --- Local config & secrets (NEVER commit these) --------------------------- #
+# config.json holds your build token and Gitea webhook secret.
+config/config.json
+# The project registry the service writes — contains per-project paths/IDs.
+config/projects.json
+# Any stray env files
+.env
+*.env
+
+# --- Runtime output the service generates ---------------------------------- #
+# Per-build logs + persisted history
+logs/
+# Build output dirs (Xcode projects, archives, .ipa) if they ever land here.
+# Normally these go to output_root (e.g. the USB), but ignore a local one too.
+output/
+builds/
+
+# --- Python venv & caches -------------------------------------------------- #
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Editor / IDE ---------------------------------------------------------- #
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- macOS ----------------------------------------------------------------- #
+.DS_Store
+.AppleDouble
+._*
+.Spotlight-V100
+.Trashes
+
+# --- Misc ------------------------------------------------------------------ #
+*.log
+*.tmp
+*.pid
