@@ -91,9 +91,17 @@ class Build:
     deploy: bool
     state: str = "queued"
     created_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None    # when it began running
+    finished_at: Optional[float] = None   # when it reached a terminal state
     returncode: Optional[int] = None
     output_dir: str = ""
     artifact: str = ""          # path to the final .ipa/.app/archive, if produced
+
+    def duration(self) -> Optional[float]:
+        if self.started_at is None:
+            return None
+        end = self.finished_at if self.finished_at is not None else time.time()
+        return max(0.0, end - self.started_at)
 
     @property
     def log_path(self) -> Path:
@@ -103,6 +111,9 @@ class Build:
         d = asdict(self)
         d["log_url"] = f"/logs/{self.id}"
         d["created_iso"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.created_at))
+        started = self.started_at if self.started_at is not None else self.created_at
+        d["started_iso"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started))
+        d["elapsed"] = self.duration()                      # seconds, live if running
         d["has_artifact"] = bool(self.artifact and Path(self.artifact).exists())
         d["artifact_url"] = f"/artifact/{self.id}" if d["has_artifact"] else ""
         return d
@@ -122,7 +133,8 @@ def save_history() -> None:
     try:
         data = [{"id": b.id, "project_id": b.project_id, "project_name": b.project_name,
                  "source": b.source, "deploy": b.deploy, "state": b.state,
-                 "created_at": b.created_at, "returncode": b.returncode,
+                 "created_at": b.created_at, "started_at": b.started_at,
+                 "finished_at": b.finished_at, "returncode": b.returncode,
                  "output_dir": b.output_dir, "artifact": b.artifact}
                 for b in list(HISTORY)]
         tmp = HISTORY_PATH.with_suffix(".tmp")
@@ -142,7 +154,8 @@ def load_history() -> None:
                 rec["state"] = "interrupted"
             HISTORY.append(Build(**{k: rec[k] for k in
                 ("id", "project_id", "project_name", "source", "deploy",
-                 "state", "created_at", "returncode", "output_dir", "artifact")
+                 "state", "created_at", "started_at", "finished_at",
+                 "returncode", "output_dir", "artifact")
                 if k in rec}))
     except Exception:
         pass
@@ -161,6 +174,7 @@ async def run_build(build: Build, project: Project) -> None:
     global CURRENT
     CURRENT = build
     build.state = "running"
+    build.started_at = time.time()
     env = os.environ.copy()
     # Per-build output directory (on the USB if OUTPUT_ROOT points there).
     out_dir = OUTPUT_ROOT / project.id / build.id
@@ -213,6 +227,11 @@ async def run_build(build: Build, project: Project) -> None:
             logf.write(f"\n=== server error: {e!r} ===\n")
         finally:
             CURRENT_PROC = None
+    build.finished_at = time.time()
+    dur = build.duration()
+    if dur is not None:
+        with open(build.log_path, "a") as lf:
+            lf.write(f"=== duration: {dur:.0f}s ===\n")
     # Find the artifact the build produced (ipa preferred, else app, else archive).
     build.artifact = _find_artifact(Path(build.output_dir)) if build.output_dir else ""
     HISTORY.appendleft(build)
@@ -229,6 +248,20 @@ def _find_artifact(out_dir: Path) -> str:
         if hits:
             return str(hits[0])
     return ""
+
+
+def avg_duration(project_id: str, n: int = 5) -> Optional[float]:
+    """Mean duration of the last up-to-n SUCCESSFUL builds of a project, for ETA.
+    Only successful builds count — a build that failed fast would skew the ETA low."""
+    durs = []
+    for b in HISTORY:
+        if b.project_id == project_id and b.state == "success":
+            d = b.duration()
+            if d and d > 0:
+                durs.append(d)
+        if len(durs) >= n:
+            break
+    return sum(durs) / len(durs) if durs else None
 
 
 def prune_outputs(project_id: str) -> None:
@@ -512,8 +545,12 @@ async def gitea_webhook(request: Request, x_gitea_signature: str = Header(defaul
 
 @app.get("/status")
 async def status():
+    cur = None
+    if CURRENT:
+        cur = CURRENT.public()
+        cur["avg_duration"] = avg_duration(CURRENT.project_id)   # for ETA/progress
     return {
-        "current": CURRENT.public() if CURRENT else None,
+        "current": cur,
         "queued": [b.public() for b in QUEUE],
         "history": [b.public() for b in list(HISTORY)[:10]],
     }

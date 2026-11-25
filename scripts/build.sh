@@ -247,11 +247,31 @@ if [[ -n "${UBS_DEVICE_UDID:-}" ]] && xcrun devicectl list devices 2>/dev/null |
   DEVICE_AVAILABLE=1
 fi
 
+# Automatic signing — this is the command-line equivalent of opening Xcode,
+# picking your team, and letting it manage the provisioning profile for you.
+# The Unity-generated project defaults to MANUAL signing (which demands a named
+# profile and fails with "requires a provisioning profile"); CODE_SIGN_STYLE=
+# Automatic + DEVELOPMENT_TEAM + -allowProvisioningUpdates makes xcodebuild
+# create/download the managed profile and sign with it, no GUI step.
+SIGN_SETTINGS=(
+  -allowProvisioningUpdates
+  CODE_SIGN_STYLE=Automatic
+  DEVELOPMENT_TEAM="$UBS_DEVELOPMENT_TEAM"
+)
+# If a bundle id is configured, pin it so the managed profile matches the app id.
+[[ -n "${UBS_BUNDLE_ID:-}" ]] && SIGN_SETTINGS+=( PRODUCT_BUNDLE_IDENTIFIER="$UBS_BUNDLE_ID" )
+
+if [[ -z "${UBS_DEVELOPMENT_TEAM:-}" ]]; then
+  log "ERROR: no Apple Team ID set for this project — signing will fail."
+  echo "  Set the Team ID in the project's settings in the UI." >&2
+  exit 1
+fi
+
 if [[ "$DEPLOY" == "1" && "$DEVICE_AVAILABLE" == "1" ]]; then
-  log "Device available — building for device and installing"
+  log "Device available — building for device and installing (automatic signing)"
   xcodebuild "${SCHEME_FLAG[@]}" -scheme Unity-iPhone -configuration Release \
-    -destination "id=$UBS_DEVICE_UDID" -allowProvisioningUpdates \
-    DEVELOPMENT_TEAM="$UBS_DEVELOPMENT_TEAM" -derivedDataPath ./DerivedData build
+    -destination "id=$UBS_DEVICE_UDID" "${SIGN_SETTINGS[@]}" \
+    -derivedDataPath ./DerivedData build
   APP_PATH="$(/usr/bin/find ./DerivedData -name '*.app' -maxdepth 4 -type d | head -n1)"
   log "Installing $APP_PATH"
   xcrun devicectl device install app --device "$UBS_DEVICE_UDID" "$APP_PATH"
@@ -259,7 +279,7 @@ if [[ "$DEPLOY" == "1" && "$DEVICE_AVAILABLE" == "1" ]]; then
 else
   [[ "$DEPLOY" == "1" ]] && log "Deploy requested but device not reachable — archiving" || log "Archiving only"
   xcodebuild "${SCHEME_FLAG[@]}" -scheme Unity-iPhone -configuration Release -sdk iphoneos \
-    -allowProvisioningUpdates DEVELOPMENT_TEAM="$UBS_DEVELOPMENT_TEAM" \
+    "${SIGN_SETTINGS[@]}" \
     -archivePath "$XCODE_BUILD_DIR/build.xcarchive" archive
   log "Archive at $XCODE_BUILD_DIR/build.xcarchive"
 fi

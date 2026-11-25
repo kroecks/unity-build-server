@@ -44,6 +44,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .logbar { display:flex; justify-content:space-between; align-items:center;
             margin-top:10px; font-size:12px; opacity:.75; }
   .logbar button { padding:5px 10px; font-size:12px; }
+  .progbar { height:8px; background:#2a2f3a; border-radius:6px; overflow:hidden; }
+  .progfill { height:100%; width:0%; background:#3b82f6; border-radius:6px;
+              transition:width .9s linear; }
+  .progfill.over { background:#f59e0b; }   /* past the ETA */
   #state { font-weight:600; margin:10px 0; }
   .queued{color:#f59e0b} .running{color:#3b82f6} .success{color:#22c55e} .failed{color:#ef4444}
   .browse-item { display:flex; justify-content:space-between; align-items:center;
@@ -105,6 +109,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </span>
     </div>
     <div id="state">idle</div>
+    <div id="progwrap" style="display:none; margin:8px 0">
+      <div class="progbar"><div class="progfill" id="progfill"></div></div>
+      <div class="logbar"><span id="progtext"></span><span id="progstart" class="hint"></span></div>
+    </div>
     <div class="logbar" id="fulllogwrap" style="display:none">
       <span class="hint">showing recent lines only</span>
       <button class="sec" id="fullLog">View full log</button>
@@ -390,9 +398,54 @@ function stream(id) {
   setState("running");
   es.onmessage = e => { pending.push(e.data); scheduleFlush(); };
   es.addEventListener("done", e => {
-    flushLog(); setState(e.data); es.close(); showStop(false); refreshStatus();
+    flushLog(); setState(e.data); es.close(); showStop(false); stopProgress(); refreshStatus();
   });
   es.onerror = () => {};
+}
+
+// ---- elapsed timer / ETA / progress bar --------------------------------- //
+// Seeded from the server each status poll; ticks locally every second so it's
+// smooth. Bar fills elapsed/avg; past the ETA it turns amber and keeps counting.
+let progTimer = null, progStartMs = 0, progAvg = null, progForId = null;
+function fmtDur(s){
+  s = Math.max(0, Math.round(s));
+  const m = Math.floor(s/60), sec = s%60;
+  return m ? `${m}m ${sec}s` : `${sec}s`;
+}
+function startProgress(_unused, elapsedSec, avgSec, startedIso){
+  progAvg = (avgSec && avgSec > 0) ? avgSec : null;  // avg can refine each poll
+  // Seed the start time only once per build so the local clock doesn't jump on
+  // every poll; use the server's elapsed (avoids phone/mini clock skew).
+  if (progForId !== currentBuildId) {
+    progForId = currentBuildId;
+    progStartMs = Date.now() - (elapsedSec||0)*1000;
+    if (progTimer) clearInterval(progTimer);
+    tickProgress();
+    progTimer = setInterval(tickProgress, 1000);
+  }
+  $("progwrap").style.display = "block";
+  $("progstart").textContent = startedIso ? ("started " + startedIso) : "";
+}
+function tickProgress(){
+  const elapsed = (Date.now() - progStartMs)/1000;
+  const fill = $("progfill"), txt = $("progtext");
+  if (progAvg){
+    const pct = Math.min(100, (elapsed/progAvg)*100);
+    fill.style.width = pct + "%";
+    fill.classList.toggle("over", elapsed > progAvg);
+    txt.textContent = elapsed > progAvg
+      ? `${fmtDur(elapsed)} — over the ~${fmtDur(progAvg)} average`
+      : `${fmtDur(elapsed)} of ~${fmtDur(progAvg)} avg (${Math.round(pct)}%)`;
+  } else {
+    // No history yet — no ETA, just a live elapsed clock and an indeterminate bar.
+    fill.style.width = "100%"; fill.classList.remove("over");
+    txt.textContent = `${fmtDur(elapsed)} elapsed · no average yet`;
+  }
+}
+function stopProgress(){
+  if (progTimer){ clearInterval(progTimer); progTimer = null; }
+  progForId = null;
+  $("progwrap").style.display = "none";
 }
 // "View full log" loads the complete on-disk log for the current build.
 async function loadFullLog() {
@@ -438,7 +491,7 @@ $("closeBuild").onclick = () => { if (es) es.close(); $("buildCard").style.displ
 // Load a finished build's saved log (tapped from history), no live stream.
 async function viewLog(b) {
   if (es) es.close();
-  currentBuildId = null; showStop(false);
+  currentBuildId = null; showStop(false); stopProgress();
   pending = []; liveLines = []; truncatedCount = 0;
   $("fulllogwrap").style.display = "none";   // finished log is loaded whole
   $("buildCard").style.display="block";
@@ -468,9 +521,14 @@ async function refreshStatus() {
   if (!wrap.children.length)
     wrap.innerHTML = '<div class="card meta">No builds yet.</div>';
 
-  // If something is building and we're not already streaming it, attach.
-  if (st.current && (!es || es.readyState === 2)) {
-    // only auto-attach if the user hasn't got a different log open
+  // Drive the progress bar from the running build, but only while we're
+  // actually viewing it (currentBuildId set by stream()). Re-seeds each poll so
+  // the elapsed clock stays accurate and the average updates as it's learned.
+  if (st.current && st.current.state === "running" && currentBuildId === st.current.id) {
+    startProgress(st.current.started_at ? null : null,  // started_at is epoch below
+                  st.current.elapsed, st.current.avg_duration, st.current.started_iso);
+  } else if (!st.current || st.current.state !== "running") {
+    stopProgress();
   }
 }
 function historyRow(b, active) {
@@ -483,6 +541,7 @@ function historyRow(b, active) {
       <span class="badge">${esc(b.source)}${b.deploy?" · deploy":""}</span>
     </div>
     <div class="meta">${esc(b.created_iso||"")} · ${esc(b.state)}${
+      b.elapsed!=null ? " · " + fmtDur(b.elapsed) : ""}${
       b.returncode!=null && b.state!=='success' ? " (rc="+b.returncode+")" : ""}</div>
     ${(b.state==='running' || b.state==='queued') ? `
     <div class="logbar" data-noclick="1">
