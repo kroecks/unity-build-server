@@ -9,7 +9,10 @@
 #   UBS_BUILD_METHOD     C# static method (BuildScript.PerformiOSBuild)
 #   UBS_DEVELOPMENT_TEAM Apple Team ID
 #   UBS_BUNDLE_ID        bundle identifier
-#   UBS_DEVICE_UDID      target device (may be empty -> archive only)
+#   UBS_DEVICES          space-separated deploy targets (iOS UDIDs / adb serials),
+#                        already filtered by the server to online, compatible
+#                        devices. Each one gets the install. Empty -> archive only.
+#   UBS_DEVICE_UDID      the first of UBS_DEVICES (legacy single-device name)
 #   UBS_RECLAIM_DISK     "1" to uninstall other editor versions when installing
 #   UBS_CLEAN_IGNORED    "1" for git clean -fdx (nukes Library/)
 #   UBS_XCODE_BUILD_DIR  where Unity writes the Xcode project
@@ -45,6 +48,19 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 log() { printf '\n\033[1m>>> %s\033[0m\n' "$*"; }
 mkdir -p "$OUTPUT_DIR"
 
+# Deploy targets. NOTE: macOS /bin/bash is 3.2, where "${arr[@]}" on an EMPTY
+# array trips `set -u` — always guard with ${#DEVICES[@]} first.
+DEVICES=()
+read -r -a DEVICES <<< "${UBS_DEVICES:-${UBS_DEVICE_UDID:-}}" || true
+INSTALLED=(); INSTALL_FAILED=()
+install_summary() {
+  # 0 if every target got the build.
+  log "Install summary: ${#INSTALLED[@]} ok, ${#INSTALL_FAILED[@]} failed"
+  [[ ${#INSTALLED[@]} -gt 0 ]] && printf '    ok:     %s\n' "${INSTALLED[@]}"
+  [[ ${#INSTALL_FAILED[@]} -gt 0 ]] && printf '    FAILED: %s\n' "${INSTALL_FAILED[@]}"
+  [[ ${#INSTALL_FAILED[@]} -eq 0 ]]
+}
+
 # --- Android / Quest helpers (adb) ------------------------------------------ #
 ADB="${UBS_ADB:-}"
 resolve_adb() {
@@ -77,14 +93,15 @@ android_device_ready() {
     *)
       log "Device $serial not reachable (state: ${state:-none})."
       echo "  USB: cable in, Developer Mode on (Quest: via the Meta Horizon app)." >&2
-      echo "  WiFi: once over USB run 'adb tcpip 5555', then use <ip>:5555 as the serial." >&2 ;;
+      echo "  WiFi: headset awake and on the same network; pair it once from the UI's" >&2
+      echo "  Devices → + WiFi device (Wireless debugging), or 'adb tcpip 5555' over USB." >&2 ;;
   esac
   return 1
 }
 
 # Install an APK via adb, classifying failures so only transient ones retry.
 install_apk_to_device() {
-  local apk="$1" serial="$UBS_DEVICE_UDID" attempt out rc
+  local apk="$1" serial="$2" attempt out rc
   if [[ "$apk" == *.aab ]]; then
     log "INSTALL SKIPPED: $apk is an App Bundle (.aab) — adb can't install it."
     echo "  Untick 'Build AAB' to get an installable .apk, or use bundletool." >&2
@@ -132,21 +149,22 @@ install_apk_to_device() {
 }
 
 launch_android_app() {
+  local serial="$1"
   [[ -n "${UBS_BUNDLE_ID:-}" ]] || { log "No package name set — not launching."; return 0; }
-  "$ADB" -s "$UBS_DEVICE_UDID" shell monkey -p "$UBS_BUNDLE_ID" \
+  "$ADB" -s "$serial" shell monkey -p "$UBS_BUNDLE_ID" \
     -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 \
     || log "  (launch failed — start it from the device; on Quest: Library → Unknown Sources)"
 }
 
 # Install a .app to the device, classifying failures so we retry only the
-# transient ones. Returns 0 on success, 1 on give-up. Needs UBS_DEVICE_UDID.
+# transient ones. Returns 0 on success, 1 on give-up.
 install_app_to_device() {
-  local app="$1" attempt out
-  log "Installing $app"
+  local app="$1" udid="$2" attempt out
+  log "Installing $app to $udid"
   for attempt in 1 2 3; do
     # Capture output so we can read the REAL reason (devicectl buries it inside
     # a generic 3002). tee keeps it visible in the live log too.
-    out="$(xcrun devicectl device install app --device "$UBS_DEVICE_UDID" "$app" 2>&1)"
+    out="$(xcrun devicectl device install app --device "$udid" "$app" 2>&1)"
     local rc=$?
     printf '%s\n' "$out"
     if [[ $rc -eq 0 ]]; then
@@ -170,6 +188,8 @@ install_app_to_device() {
     if printf '%s' "$out" | grep -qiE "This application's application-identifier entitlement|does not match|provisioning profile"; then
       log "INSTALL FAILED: signing/provisioning mismatch — rebuild required."
       printf '%s\n' "$out" | grep -iE "entitlement|provisioning|identifier" | head -4 | sed 's/^/    /' >&2
+      echo "  If this device was never built for, run a Build with it selected so Xcode" >&2
+      echo "  registers it in the provisioning profile; Install can then reuse that build." >&2
       return 1
     fi
     # Otherwise treat as transient (sleep/lock/network) and retry.
@@ -186,14 +206,18 @@ install_app_to_device() {
 # without rebuilding. We skip straight to the install, with the same retries.
 if [[ "${UBS_INSTALL_ONLY:-0}" == "1" ]]; then
   ART="${UBS_INSTALL_ARTIFACT:-}"
-  log "Install-only: pushing existing artifact to device"
-  [[ -n "$UBS_DEVICE_UDID" ]] || { log "ERROR: no device UDID / adb serial set."; exit 1; }
+  log "Install-only: pushing existing artifact to ${#DEVICES[@]} device(s)"
+  [[ ${#DEVICES[@]} -gt 0 ]] || { log "ERROR: no target device is online (see deploy targets above)."; exit 1; }
   [[ -n "$ART" && -e "$ART" ]] || { log "ERROR: artifact not found: $ART"; exit 1; }
   if [[ "$PLATFORM" == "android" ]]; then
-    if install_apk_to_device "$ART"; then
-      log "Installed. Launching…"; launch_android_app
-      log "DONE"; exit 0
-    fi
+    for serial in "${DEVICES[@]}"; do
+      if install_apk_to_device "$ART" "$serial"; then
+        INSTALLED+=("$serial"); log "Installed on $serial. Launching…"; launch_android_app "$serial"
+      else
+        INSTALL_FAILED+=("$serial")
+      fi
+    done
+    install_summary && { log "DONE"; exit 0; }
     exit 1
   fi
   # If the artifact is an .xcarchive or .ipa we need the .app inside; devicectl
@@ -204,11 +228,15 @@ if [[ "${UBS_INSTALL_ONLY:-0}" == "1" ]]; then
     APP_PATH="$(/usr/bin/find "$(dirname "$ART")" -name '*.app' -type d -maxdepth 5 2>/dev/null | head -n1)"
   fi
   [[ -n "$APP_PATH" && -d "$APP_PATH" ]] || { log "ERROR: no .app found to install from $ART"; exit 1; }
-  if install_app_to_device "$APP_PATH"; then
-    log "Installed. Launching…"
-    xcrun devicectl device process launch --device "$UBS_DEVICE_UDID" "$UBS_BUNDLE_ID" || true
-    log "DONE"; exit 0
-  fi
+  for udid in "${DEVICES[@]}"; do
+    if install_app_to_device "$APP_PATH" "$udid"; then
+      INSTALLED+=("$udid"); log "Installed on $udid. Launching…"
+      xcrun devicectl device process launch --device "$udid" "$UBS_BUNDLE_ID" || true
+    else
+      INSTALL_FAILED+=("$udid")
+    fi
+  done
+  install_summary && { log "DONE"; exit 0; }
   exit 1
 fi
 
@@ -614,14 +642,20 @@ if [[ "$PLATFORM" == "android" ]]; then
     log "ERROR: Unity reported success but no .apk/.aab is in $ANDROID_OUT_DIR"; exit 1; }
   log "Artifact: $PLAYER_OUT ($(du -h "$PLAYER_OUT" | cut -f1))"
   if [[ "$DEPLOY" == "1" ]]; then
-    if [[ -z "${UBS_DEVICE_UDID:-}" ]]; then
-      log "Deploy requested but NO adb serial is set for this project."
+    if [[ ${#DEVICES[@]} -eq 0 ]]; then
+      log "Deploy requested but no target device is online (see deploy targets at the top)."
       resolve_adb && { echo "  Connected devices right now:" >&2; "$ADB" devices -l 2>&1 | sed 's/^/    /' >&2; } || true
-    elif install_apk_to_device "$PLAYER_OUT"; then
-      log "Installed to device. Launching…"; launch_android_app
     else
-      # Same as iOS: the build is good; Install can push it later.
-      log "DONE (build succeeded, install pending — see reason above)"; exit 0
+      for serial in "${DEVICES[@]}"; do
+        if install_apk_to_device "$PLAYER_OUT" "$serial"; then
+          INSTALLED+=("$serial"); log "Installed on $serial. Launching…"; launch_android_app "$serial"
+        else
+          INSTALL_FAILED+=("$serial")
+        fi
+      done
+      # Same as iOS: the build is good even if an install didn't land; Install
+      # can push it later.
+      install_summary || { log "DONE (build succeeded, some installs pending — see above)"; exit 0; }
     fi
   fi
   log "DONE"; exit 0
@@ -637,51 +671,45 @@ else
 fi
 
 # Device detection — made explicit and loud so a missed device is visible in the
-# log instead of silently falling through to "archive only".
-DEVICE_AVAILABLE=0
+# log instead of silently falling through to "archive only". The server already
+# picked online targets, but a Unity build takes a while: re-check each one.
+AVAIL=()
 if [[ "$DEPLOY" == "1" ]]; then
-  if [[ -z "${UBS_DEVICE_UDID:-}" ]]; then
-    log "Deploy requested but NO device UDID is set for this project."
-    echo "  Set the Device UDID in the project's settings to install to your phone." >&2
+  if [[ ${#DEVICES[@]} -eq 0 ]]; then
+    log "Deploy requested but no target device is online (see deploy targets at the top)."
     echo "  Connected devices right now:" >&2
     xcrun devicectl list devices 2>&1 | sed 's/^/    /' >&2 || true
   else
-    log "Deploy requested — looking for device $UBS_DEVICE_UDID"
-    # Use devicectl's JSON output and match the UDID exactly against a CONNECTED
-    # physical device. The pretty-printed table appends " (UDID)" and lists
-    # shutdown simulators, so JSON is far more reliable to parse.
-    DEV_JSON="$(xcrun devicectl list devices --json-output - 2>/dev/null || true)"
-    # Show the human-readable list in the log for visibility.
+    log "Deploy requested — checking ${#DEVICES[@]} device(s): ${DEVICES[*]}"
+    # devicectl JSON, matched exactly on UDID. The pretty table appends
+    # " (UDID)" and lists unreachable devices, so JSON is far more reliable.
+    DEV_JSON_FILE="$(mktemp -t devicectl)"
+    xcrun devicectl list devices --json-output "$DEV_JSON_FILE" >/dev/null 2>&1 || true
     xcrun devicectl list devices 2>/dev/null | sed 's/^/    /' || true
-    MATCH="$(printf '%s' "$DEV_JSON" | python3 -I -c '
+    FOUND="$(python3 -I -c '
 import sys, json
-want = sys.argv[1]
-try: data = json.load(sys.stdin)
-except Exception: sys.exit(1)
-devs = (data.get("result") or {}).get("devices") or []
-for d in devs:
+try: data = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+seen = {}
+for d in (data.get("result") or {}).get("devices") or []:
     udid = (d.get("hardwareProperties") or {}).get("udid") or d.get("identifier") or ""
-    state = (d.get("connectionProperties") or {}).get("tunnelState") \
-            or (d.get("deviceProperties") or {}).get("connectionState") or ""
-    if udid == want:
-        print("found"); sys.exit(0)
-sys.exit(1)
-' "$UBS_DEVICE_UDID" 2>/dev/null || true)"
-    if [[ "$MATCH" == "found" ]]; then
-      DEVICE_AVAILABLE=1
-      log "Device $UBS_DEVICE_UDID found — will install after build."
-    else
-      # Fall back to a plain substring match in case the JSON shape differs on
-      # this Xcode version — better to try the install than wrongly archive.
-      if xcrun devicectl list devices 2>/dev/null | grep -q "$UBS_DEVICE_UDID"; then
-        DEVICE_AVAILABLE=1
-        log "Device $UBS_DEVICE_UDID found (table match) — will install after build."
+    state = ((d.get("connectionProperties") or {}).get("tunnelState") or "").lower()
+    seen[udid] = state
+for want in sys.argv[2:]:
+    if want in seen and seen[want] != "unavailable":
+        print(want)
+' "$DEV_JSON_FILE" "${DEVICES[@]}" 2>/dev/null || true)"
+    rm -f "$DEV_JSON_FILE"
+    for udid in "${DEVICES[@]}"; do
+      if printf '%s\n' "$FOUND" | grep -qx "$udid" \
+         || xcrun devicectl list devices 2>/dev/null | grep -q "$udid"; then
+        AVAIL+=("$udid"); log "Device $udid found — will install after build."
       else
-        log "Device $UBS_DEVICE_UDID NOT found above."
-        echo "  Check: phone plugged in, unlocked, trusted, Developer Mode on." >&2
-        echo "  The UDID must match exactly (incl. the dash)." >&2
+        log "Device $udid NOT reachable now — skipping it (Install it later)."
+        echo "  Check: plugged in or on the same WiFi, unlocked, trusted, Developer Mode on." >&2
+        INSTALL_FAILED+=("$udid")
       fi
-    fi
+    done
   fi
 fi
 
@@ -717,10 +745,11 @@ fi
 DERIVED_DATA="$XCODE_BUILD_DIR/DerivedData"
 mkdir -p "$DERIVED_DATA"
 
-if [[ "$DEPLOY" == "1" && "$DEVICE_AVAILABLE" == "1" ]]; then
-  log "Device available — building for device and installing (automatic signing)"
+if [[ "$DEPLOY" == "1" && ${#AVAIL[@]} -gt 0 ]]; then
+  FIRST="${AVAIL[0]}"
+  log "Building for device $FIRST and installing to ${#AVAIL[@]} device(s) (automatic signing)"
   xcodebuild "${SCHEME_FLAG[@]}" -scheme Unity-iPhone -configuration Release \
-    -destination "id=$UBS_DEVICE_UDID" "${SIGN_SETTINGS[@]}" \
+    -destination "id=$FIRST" "${SIGN_SETTINGS[@]}" \
     -derivedDataPath "$DERIVED_DATA" build
   APP_PATH="$(/usr/bin/find "$DERIVED_DATA" -name '*.app' -maxdepth 5 -type d | head -n1)"
   # Also archive, so a successful device build is still promotable to TestFlight
@@ -731,18 +760,30 @@ if [[ "$DEPLOY" == "1" && "$DEVICE_AVAILABLE" == "1" ]]; then
     -archivePath "$XCODE_BUILD_DIR/build.xcarchive" archive \
     >/dev/null 2>&1 || log "  (archive step skipped/failed — device build still OK)"
 
-  if install_app_to_device "$APP_PATH"; then
-    log "Installed to device. Launching…"
-    xcrun devicectl device process launch --device "$UBS_DEVICE_UDID" "$UBS_BUNDLE_ID" || true
-    log "DONE"
-  else
-    # Build succeeded; only the install didn't land. Don't fail the whole build —
-    # the artifact is good, and the UI's Install button can push it later.
-    log "DONE (build succeeded, install pending — see reason above)"
-  fi
+  for udid in "${AVAIL[@]}"; do
+    if [[ "$udid" != "$FIRST" ]]; then
+      # Incremental re-build against THIS device: near-instant (same arch, same
+      # DerivedData), but it makes automatic signing register the device and
+      # refresh the profile — e.g. an iPad that's never been built for.
+      log "Refreshing signing for $udid"
+      xcodebuild "${SCHEME_FLAG[@]}" -scheme Unity-iPhone -configuration Release \
+        -destination "id=$udid" "${SIGN_SETTINGS[@]}" \
+        -derivedDataPath "$DERIVED_DATA" build >/dev/null 2>&1 \
+        || log "  (signing refresh for $udid failed — trying the install anyway)"
+    fi
+    if install_app_to_device "$APP_PATH" "$udid"; then
+      INSTALLED+=("$udid"); log "Installed on $udid. Launching…"
+      xcrun devicectl device process launch --device "$udid" "$UBS_BUNDLE_ID" || true
+    else
+      INSTALL_FAILED+=("$udid")
+    fi
+  done
+  # Build succeeded; an install that didn't land doesn't fail the build — the
+  # artifact is good, and the UI's Install button can push it later.
+  install_summary && log "DONE" || log "DONE (build succeeded, some installs pending — see above)"
   exit 0
 else
-  [[ "$DEPLOY" == "1" ]] && log "Deploy requested but device not reachable — archiving" || log "Archiving only"
+  [[ "$DEPLOY" == "1" ]] && log "Deploy requested but no device reachable — archiving" || log "Archiving only"
   xcodebuild "${SCHEME_FLAG[@]}" -scheme Unity-iPhone -configuration Release -sdk iphoneos \
     "${SIGN_SETTINGS[@]}" -derivedDataPath "$DERIVED_DATA" \
     -archivePath "$XCODE_BUILD_DIR/build.xcarchive" archive

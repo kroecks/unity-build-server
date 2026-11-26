@@ -66,6 +66,27 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .trow .tbar > div { height:100%; background:#3b82f6; }
   .trow.hot .tbar > div { background:#f59e0b; }
   .thead { margin:10px 0 2px; opacity:.6; text-transform:uppercase; letter-spacing:.04em; font-size:11px; }
+  /* devices */
+  .dev { display:flex; align-items:center; gap:10px; padding:9px 2px; border-bottom:1px solid #222733; }
+  .dev:last-child { border-bottom:0; }
+  .dev .grow { flex:1; min-width:0; }
+  .dev button { padding:5px 9px; font-size:12px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:#4b5563; flex:0 0 auto; }
+  .dot.on { background:#22c55e; box-shadow:0 0 6px #22c55e88; }
+  .dot.warn { background:#f59e0b; }
+  .chip { display:inline-flex; align-items:center; gap:5px; font-size:12px; padding:2px 8px;
+          border-radius:20px; background:#222733; margin:4px 4px 0 0; }
+  .modal { position:fixed; inset:0; background:#000a; display:flex; align-items:flex-end;
+           justify-content:center; z-index:50; }
+  .modal-box { background:#1a1d24; border:1px solid #2a2f3a; border-radius:14px 14px 0 0;
+               width:100%; max-width:720px; max-height:80vh; overflow:auto; padding:14px; }
+  @media (min-width:740px){ .modal { align-items:center; } .modal-box { border-radius:14px; } }
+  .pick { display:flex; align-items:center; gap:10px; padding:11px 4px; border-bottom:1px solid #222733; cursor:pointer; }
+  .pick input { width:20px; height:20px; }
+  .pick.off { opacity:.5; cursor:default; }
+  .kinds { display:flex; gap:14px; flex-wrap:wrap; }
+  .kinds label { display:flex; align-items:center; gap:6px; margin:4px 0; }
+  .kinds input { width:auto; }
 </style>
 </head>
 <body>
@@ -77,6 +98,34 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="card">
     <label for="token">Build token <small class="hint">(stored on this device only)</small></label>
     <input id="token" type="password" placeholder="token" autocomplete="off">
+  </div>
+
+  <div class="logbar" style="margin-top:4px">
+    <h2 style="margin:0">Devices</h2>
+    <span>
+      <button class="sec" id="toggleAddDev" title="Pair / connect a device over WiFi">+ WiFi device</button>
+      <button class="sec" id="scanDevices">↻ Scan</button>
+    </span>
+  </div>
+  <div class="card" id="devices" style="padding:4px 12px"><div class="meta">Scanning…</div></div>
+  <div class="card" id="addDevPanel" style="display:none">
+    <b>Add a device over WiFi</b>
+    <div class="meta" style="margin-top:6px">
+      <b>Quest / Android 11+ (Wireless debugging):</b> on the device open Developer options →
+      Wireless debugging → <i>Pair device with pairing code</i>. Enter the address and code it
+      shows. Pair once; after that it's found automatically on every scan, even after reboots.<br>
+      <b>Already in tcpip mode</b> (<code>adb tcpip 5555</code> over USB): enter <code>ip:5555</code>
+      and tap Connect.
+    </div>
+    <div class="row" style="margin-top:6px">
+      <div style="flex:2"><label>Address</label><input id="devAddr" type="text" placeholder="192.168.1.42:37123" autocomplete="off"></div>
+      <div><label>Pairing code</label><input id="devCode" type="text" inputmode="numeric" placeholder="123456" autocomplete="off"></div>
+    </div>
+    <div class="btn-row">
+      <button id="devPair">Pair</button>
+      <button class="sec" id="devConnect">Connect</button>
+    </div>
+    <div class="meta" id="devOut" style="white-space:pre-wrap"></div>
   </div>
 
   <div id="projects"></div>
@@ -169,6 +218,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div id="allbuilds"></div>
   <button class="sec full" id="loadMore" style="display:none; margin-top:8px">Load more</button>
 
+<div class="modal" id="picker" style="display:none">
+  <div class="modal-box">
+    <div class="proj-head">
+      <b id="pickTitle">Pick devices</b>
+      <button class="sec" id="pickClose" style="padding:6px 10px">✕</button>
+    </div>
+    <div class="meta" id="pickSub"></div>
+    <div id="pickList" style="margin-top:6px"></div>
+    <div class="btn-row">
+      <button class="sec" id="pickRescan" style="flex:0 0 auto">↻</button>
+      <button id="pickGo">Install</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 const token = () => $("token").value;
@@ -185,13 +249,216 @@ async function api(method, url, body) {
   return r.json();
 }
 
+// ---- devices ------------------------------------------------------------- //
+// The inventory comes from /api/devices (adb + devicectl scan on the mini).
+// Projects target device KINDS (quest / android / iphone / ipad) and keep a
+// list of default device ids; Install / Build to… / logs pick per run.
+let DEVS = [];
+let KIND_LABEL = { quest:"Quest", android:"Android", iphone:"iPhone", ipad:"iPad" };
+let PLATFORM_KINDS = { ios:["iphone","ipad"], android:["quest","android"] };
+let PROJS = [];
+let DEV_ERRORS = [];
+let DEVS_LOADED = false;
+
+const devById = id => DEVS.find(d => d.id === id);
+const platOf = p => (p.platform || "ios");
+function allowedKinds(p) {
+  const every = PLATFORM_KINDS[platOf(p)] || [];
+  const ks = (p.target_kinds || []).filter(k => every.includes(k));
+  return ks.length ? ks : every;
+}
+const compatible = (p, d) => d.platform === platOf(p) && allowedKinds(p).includes(d.kind);
+function defaultIds(p) {
+  if ((p.deploy_devices || []).length) return p.deploy_devices;
+  if (p.device_udid) {   // legacy single target
+    const d = DEVS.find(d => [d.id, d.transport, d.wifi_address, d.udid].includes(p.device_udid));
+    return [d ? d.id : p.device_udid];
+  }
+  return [];
+}
+function devState(d) {
+  if (d.online) return `online · ${d.connection || "?"}`;
+  if (d.state === "unauthorized") return "unauthorized — accept the debugging prompt on the device";
+  if (d.last_seen) return `offline · seen ${ago(d.last_seen)}`;
+  return d.state || "offline";
+}
+function ago(t) {
+  const s = Date.now()/1000 - t;
+  if (s < 90) return "just now";
+  if (s < 3600) return Math.round(s/60) + " min ago";
+  if (s < 86400) return Math.round(s/3600) + " h ago";
+  return Math.round(s/86400) + " d ago";
+}
+const dotCls = d => d.online ? "dot on" : (d.state === "unauthorized" ? "dot warn" : "dot");
+
+async function loadDevices(refresh) {
+  try {
+    const r = await (await fetch("/api/devices" + (refresh ? "?refresh=1" : ""))).json();
+    DEVS = r.devices || []; KIND_LABEL = r.kinds || KIND_LABEL;
+    PLATFORM_KINDS = r.platform_kinds || PLATFORM_KINDS;
+    DEV_ERRORS = r.errors || []; DEVS_LOADED = true;
+    renderDevices(); renderAllChips();
+  } catch(e) { $("devices").innerHTML = `<div class="meta">Device scan failed: ${esc(e.message)}</div>`; }
+}
+function renderDevices() {
+  if (!DEVS_LOADED) return;
+  const wrap = $("devices"); wrap.innerHTML = "";
+  if (!DEVS.length) {
+    wrap.innerHTML = `<div class="meta" style="padding:8px 0">No devices yet. Plug one in over USB
+      (Quest: Developer Mode on, accept “Allow USB debugging”), or add one over WiFi.</div>`;
+  }
+  for (const d of DEVS) {
+    const row = document.createElement("div"); row.className = "dev";
+    const users = PROJS.filter(p => defaultIds(p).includes(d.id)).map(p => p.name);
+    row.innerHTML = `
+      <span class="${dotCls(d)}"></span>
+      <div class="grow">
+        <div><b>${esc(d.name)}</b> <span class="badge">${esc(d.kind_label || d.kind)}</span></div>
+        <div class="meta">${esc(devState(d))}${d.model && d.model !== d.name ? " · " + esc(d.model) : ""}
+          · <span title="device id">${esc(d.id)}</span></div>
+        ${users.length ? `<div class="meta">default for: ${users.map(esc).join(", ")}</div>` : ""}
+      </div>
+      <button class="sec" data-a="ren" title="Rename">✎</button>
+      <button class="sec" data-a="forget" title="Forget">✕</button>`;
+    row.querySelector('[data-a="ren"]').onclick = async () => {
+      const n = prompt("Name for this device:", d.name); if (n === null) return;
+      try { await api("PATCH", `/api/devices/${encodeURIComponent(d.id)}`, { name:n }); loadDevices(); }
+      catch(e){ alert("Rename failed: " + e.message); }
+    };
+    row.querySelector('[data-a="forget"]').onclick = async () => {
+      if (!confirm(`Forget ${d.name}? It's removed from project defaults; it reappears if scanned again.`)) return;
+      try { await api("DELETE", `/api/devices/${encodeURIComponent(d.id)}`); await loadProjects(); loadDevices(); }
+      catch(e){ alert("Forget failed: " + e.message); }
+    };
+    wrap.appendChild(row);
+  }
+  for (const e of DEV_ERRORS) {
+    const m = document.createElement("div"); m.className = "meta"; m.style.color = "#fbbf24";
+    m.textContent = e; wrap.appendChild(m);
+  }
+}
+$("scanDevices").onclick = async () => {
+  $("scanDevices").disabled = true; $("scanDevices").textContent = "Scanning…";
+  try { await loadDevices(true); }
+  finally { $("scanDevices").disabled = false; $("scanDevices").textContent = "↻ Scan"; }
+};
+$("toggleAddDev").onclick = () => {
+  const p = $("addDevPanel"); p.style.display = p.style.display === "none" ? "block" : "none";
+};
+async function devWifi(kind) {
+  const body = { address: $("devAddr").value.trim() };
+  if (kind === "pair") body.code = $("devCode").value.trim();
+  $("devOut").textContent = kind === "pair" ? "Pairing…" : "Connecting…";
+  try {
+    const r = await api("POST", `/api/devices/${kind}`, body);
+    $("devOut").textContent = (r.ok ? "✓ " : "✕ ") + (r.output || "")
+      + (r.ok && kind === "pair" ? "\nPaired. It should appear above within a scan or two." : "");
+    loadDevices(true);
+  } catch(e) { $("devOut").textContent = "✕ " + e.message; }
+}
+$("devPair").onclick = () => devWifi("pair");
+$("devConnect").onclick = () => devWifi("connect");
+
+// ---- device picker (Install / Build to… / logs) -------------------------- //
+// Resolves to an array of device ids, or null if cancelled. multi=false is a
+// single choice (logs) and auto-picks when exactly one device is online.
+function pickDevices(p, { title, go, multi = true }) {
+  return new Promise(async resolve => {
+    let list = [], incompatible = 0;
+    const fetchList = async (refresh) => {
+      $("pickList").innerHTML = '<div class="meta">Scanning…</div>';
+      try {
+        const r = await (await fetch(`/api/projects/${p.id}/devices${refresh ? "?refresh=1" : ""}`)).json();
+        list = r.devices || []; incompatible = r.incompatible_count || 0;
+        $("pickSub").textContent = `${p.name} deploys to `
+          + (r.allowed_kinds || []).map(k => KIND_LABEL[k] || k).join(" / ")
+          + (incompatible ? ` · ${incompatible} other device(s) hidden` : "");
+      } catch(e) { list = []; $("pickSub").textContent = "Scan failed: " + e.message; }
+    };
+    await fetchList(false);
+    if (!multi) {
+      const on = list.filter(d => d.online);
+      if (on.length === 1) { resolve([on[0].id]); return; }
+    }
+    const checked = new Set(list.filter(d => d.online && d.default).map(d => d.id));
+    if (!checked.size && multi) {            // nothing defaulted: preselect if only one online
+      const on = list.filter(d => d.online); if (on.length === 1) checked.add(on[0].id);
+    }
+    const render = () => {
+      const wrap = $("pickList"); wrap.innerHTML = "";
+      if (!list.length) wrap.innerHTML = '<div class="meta">No compatible devices known. Plug one in or add one over WiFi, then ↻.</div>';
+      for (const d of list) {
+        const row = document.createElement("label"); row.className = "pick" + (d.online ? "" : " off");
+        row.innerHTML = `
+          <input type="${multi ? "checkbox" : "radio"}" name="pickdev" ${checked.has(d.id) ? "checked" : ""} ${d.online ? "" : "disabled"}>
+          <span class="${dotCls(d)}"></span>
+          <div class="grow" style="flex:1"><b>${esc(d.name)}</b> <span class="badge">${esc(d.kind_label)}</span>
+            ${d.default ? '<span class="badge ok">default</span>' : ""}
+            <div class="meta">${esc(devState(d))}</div></div>`;
+        const inp = row.querySelector("input");
+        inp.onchange = () => {
+          if (!multi) checked.clear();
+          inp.checked ? checked.add(d.id) : checked.delete(d.id);
+          update();
+        };
+        wrap.appendChild(row);
+      }
+      update();
+    };
+    const update = () => {
+      $("pickGo").disabled = !checked.size;
+      $("pickGo").textContent = checked.size > 1 ? `${go} (${checked.size})` : go;
+    };
+    const close = (v) => { $("picker").style.display = "none"; resolve(v); };
+    $("pickTitle").textContent = title;
+    $("pickClose").onclick = () => close(null);
+    $("picker").onclick = (e) => { if (e.target === $("picker")) close(null); };
+    $("pickRescan").onclick = async () => { await fetchList(true);
+      for (const id of [...checked]) if (!list.some(d => d.id === id && d.online)) checked.delete(id);
+      render(); };
+    $("pickGo").onclick = () => close([...checked]);
+    render();
+    $("picker").style.display = "flex";
+  });
+}
+
+async function installTo(projectId, buildId, btn) {
+  const p = PROJS.find(x => x.id === projectId);
+  if (!p) { alert("Project no longer exists"); return; }
+  const ids = await pickDevices(p, { title: "Install to…", go: "Install" });
+  if (!ids || !ids.length) return;
+  if (btn) { btn.disabled = true; btn.textContent = "Installing…"; }
+  try { await api("POST", `/build/${projectId}/install/${buildId}`, { devices: ids }); refreshStatus(); }
+  catch(e){ alert("Install failed: " + e.message); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = "📲 Install"; } }
+}
+
+// Chips on each project card: its default targets with live status.
+function chipsHtml(p) {
+  const ids = defaultIds(p);
+  const kinds = allowedKinds(p).map(k => KIND_LABEL[k] || k).join(" / ");
+  if (!ids.length) return `<span class="meta">Targets ${esc(kinds)} · no default — Build won't install; use “Build to…”</span>`;
+  return `<span class="meta">Deploys to:</span> ` + ids.map(id => {
+    const d = devById(id);
+    return d ? `<span class="chip"><span class="${dotCls(d)}"></span>${esc(d.name)}</span>`
+             : `<span class="chip"><span class="dot"></span>${esc(id)}</span>`;
+  }).join("");
+}
+function renderAllChips() {
+  document.querySelectorAll("[data-chips]").forEach(el => {
+    const p = PROJS.find(x => x.id === el.dataset.chips); if (p) el.innerHTML = chipsHtml(p);
+  });
+}
+
 // ---- project list -------------------------------------------------------- //
 async function loadProjects() {
   let projs = [];
   try { projs = await (await fetch("/api/projects")).json(); } catch(e){}
+  PROJS = projs;
   const wrap = $("projects"); wrap.innerHTML = "";
   if (!projs.length) { wrap.innerHTML = '<div class="card meta">No projects yet. Onboard one below.</div>'; return; }
   for (const p of projs) wrap.appendChild(projectCard(p));
+  renderDevices();   // refresh the "default for" lines
 }
 
 const isAndroid = p => (p.platform || "ios") === "android";
@@ -220,20 +487,34 @@ function projectCard(p) {
                    + (p.keystore_path ? " · release-signed" : " · debug-signed") : ""}</div>
     <div class="meta">${esc(p.local_path)}</div>
     ${needs.length ? `<div class="meta" style="color:#fbbf24">Needs: ${needs.join(", ")} — tap Edit</div>` : ""}
+    <div data-chips="${p.id}" style="margin-top:6px">${chipsHtml(p)}</div>
     <div class="btn-row">
       <button data-act="build" ${needs.length?"disabled":""}>Build${needs.length?" (configure first)":""}</button>
+      <button class="sec" data-act="buildto" ${needs.length?"disabled":""} title="Build and install to devices you pick">Build to…</button>
       <button class="sec" data-act="edit">Edit</button>
-      ${p.device_udid ? '<button class="sec" data-act="devlogs">Device logs (relaunch)</button>' : ""}
-      ${p.device_udid ? '<button class="sec" data-act="lastlogs">Last run logs</button>' : ""}
-      ${p.device_udid ? `<a href="/device-logs-zip/${p.id}"><button class="sec" title="Download all log sources as a zip">⤓ Logs zip</button></a>` : ""}
+    </div>
+    <div class="btn-row">
+      <button class="sec" data-act="devlogs">Device logs (relaunch)</button>
+      <button class="sec" data-act="lastlogs">Last run logs</button>
+      <button class="sec" data-act="logzip" title="Download all log sources as a zip">⤓ Logs zip</button>
     </div>
     <div class="editArea" style="display:none"></div>`;
   el.querySelector('[data-act="build"]').onclick = () => startBuild(p);
+  el.querySelector('[data-act="buildto"]').onclick = async () => {
+    const ids = await pickDevices(p, { title: "Build and install to…", go: "Build & install" });
+    if (ids && ids.length) startBuild(p, ids);
+  };
   el.querySelector('[data-act="edit"]').onclick = () => toggleEdit(el, p);
-  const dl = el.querySelector('[data-act="devlogs"]');
-  if (dl) dl.onclick = () => streamDeviceLogs(p);
-  const ll = el.querySelector('[data-act="lastlogs"]');
-  if (ll) ll.onclick = () => streamLastRunLogs(p);
+  // Logs read from ONE device: auto-picked when only one is online.
+  const logDev = async () => {
+    const ids = await pickDevices(p, { title: "Logs from which device?", go: "Show logs", multi: false });
+    return ids && ids.length ? ids[0] : null;
+  };
+  el.querySelector('[data-act="devlogs"]').onclick = async () => { const d = await logDev(); if (d) streamDeviceLogs(p, d); };
+  el.querySelector('[data-act="lastlogs"]').onclick = async () => { const d = await logDev(); if (d) streamLastRunLogs(p, d); };
+  el.querySelector('[data-act="logzip"]').onclick = async () => {
+    const d = await logDev(); if (d) location.href = `/device-logs-zip/${p.id}?device=${encodeURIComponent(d)}`;
+  };
   return el;
 }
 
@@ -253,9 +534,10 @@ function toggleEdit(el, p) {
     </div>
     <label><span data-only="ios">Bundle ID</span><span data-only="android">Package name <small class="hint">(applicationId, e.g. com.terro.game — used to launch &amp; read logs)</small></span></label>
     <input type="text" data-f="bundle_id" value="${esc(p.bundle_id)}">
-    <label><span data-only="ios">Device UDID</span><span data-only="android">ADB serial <small class="hint">(from <code>adb devices</code>; or ip:5555 for WiFi after <code>adb tcpip 5555</code>)</small></span>
-      <small class="hint">(optional; blank = build only)</small></label>
-    <input type="text" data-f="device_udid" value="${esc(p.device_udid)}">
+    <label>Device kinds <small class="hint">(what this project may install onto — e.g. only Quest, so it never lands on a phone)</small></label>
+    <div class="kinds" data-kinds></div>
+    <label>Default deploy targets <small class="hint">(Build and git-push deploys install to each one that's online; none = build only)</small></label>
+    <div data-targets></div>
     <div data-only="android">
       <div class="toggle"><input type="checkbox" data-f="android_build_aab" ${p.android_build_aab?"checked":""}><label>Build AAB (Play Store) instead of APK — AABs can't be adb-installed</label></div>
       <div class="row">
@@ -270,7 +552,7 @@ function toggleEdit(el, p) {
       <select data-f="branch" id="branchSel-${p.id}"><option value="${esc(p.branch)}">${esc(p.branch)}</option></select>
       <button class="sec" data-s="loadbr" style="flex:0 0 auto">↻ branches</button>
     </div>
-    <div class="toggle"><input type="checkbox" data-f="webhook_deploys" ${p.webhook_deploys?"checked":""}><label>Deploy to phone on git push</label></div>
+    <div class="toggle"><input type="checkbox" data-f="webhook_deploys" ${p.webhook_deploys?"checked":""}><label>Deploy to the default targets on git push</label></div>
     <div class="toggle"><input type="checkbox" data-f="reclaim_disk" ${p.reclaim_disk?"checked":""}><label>Uninstall other Unity versions to save space</label></div>
     <div class="toggle"><input type="checkbox" data-f="clean_ignored" ${p.clean_ignored?"checked":""}><label>git clean -fdx (nukes Library/, slower builds)</label></div>
 
@@ -308,7 +590,55 @@ function toggleEdit(el, p) {
   const applyPlat = () => area.querySelectorAll("[data-only]").forEach(n => {
     n.style.display = n.dataset.only === platSel.value ? "" : "none";
   });
-  platSel.onchange = applyPlat; applyPlat();
+  // ---- device targeting: kinds for the selected platform, then the known
+  // devices of those kinds as default-target checkboxes.
+  let kinds = new Set((p.target_kinds || []).length ? p.target_kinds : (PLATFORM_KINDS[plat] || []));
+  const targets = new Set(defaultIds(p).filter(id => devById(id)));
+  const legacy = defaultIds(p).find(id => !devById(id));   // device_udid not seen by a scan yet
+  const renderTargeting = () => {
+    const pl = platSel.value, every = PLATFORM_KINDS[pl] || [];
+    if (![...kinds].some(k => every.includes(k))) kinds = new Set(every);
+    const kw = area.querySelector("[data-kinds]"); kw.innerHTML = "";
+    for (const k of every) {
+      const l = document.createElement("label");
+      l.innerHTML = `<input type="checkbox" ${kinds.has(k) ? "checked" : ""}> ${esc(KIND_LABEL[k] || k)}`;
+      l.querySelector("input").onchange = (e) => {
+        e.target.checked ? kinds.add(k) : kinds.delete(k);
+        if (![...kinds].some(x => every.includes(x))) { kinds.add(k); e.target.checked = true; }  // keep ≥1
+        renderTargeting();
+      };
+      kw.appendChild(l);
+    }
+    const tw = area.querySelector("[data-targets]"); tw.innerHTML = "";
+    const devs = DEVS.filter(d => d.platform === pl && kinds.has(d.kind));
+    for (const id of [...targets]) if (!devs.some(d => d.id === id)) targets.delete(id);
+    if (!devs.length) tw.innerHTML = '<div class="meta">No matching devices known yet — connect one and ↻ Scan.</div>';
+    for (const d of devs) {
+      const l = document.createElement("label"); l.className = "pick";
+      l.innerHTML = `<input type="checkbox" ${targets.has(d.id) ? "checked" : ""}>
+        <span class="${dotCls(d)}"></span><div><b>${esc(d.name)}</b> <span class="badge">${esc(d.kind_label)}</span>
+        <div class="meta">${esc(devState(d))}</div></div>`;
+      l.querySelector("input").onchange = (e) => { e.target.checked ? targets.add(d.id) : targets.delete(d.id); };
+      tw.appendChild(l);
+    }
+    if (legacy && pl === plat) {
+      const m = document.createElement("div"); m.className = "meta"; m.style.color = "#fbbf24";
+      m.textContent = `Legacy target “${legacy}” hasn't shown up in a scan yet; it's kept until it does.`;
+      tw.appendChild(m);
+    }
+  };
+  platSel.onchange = () => { applyPlat(); renderTargeting(); }; applyPlat(); renderTargeting();
+  area._getTargeting = () => {
+    if (!DEVS_LOADED) return {};   // inventory not loaded yet: don't touch targets
+    const every = PLATFORM_KINDS[platSel.value] || [];
+    const tk = every.filter(k => kinds.has(k));
+    return {
+      target_kinds: tk.length === every.length ? [] : tk,   // all kinds = [] (follows the platform)
+      deploy_devices: [...targets],
+      // The picker replaces the legacy single field once its device is known.
+      ...(legacy ? {} : { device_udid: "" }),
+    };
+  };
 
   // ---- pre-build steps editor ----
   const stepsWrap = area.querySelector(`#steps-${p.id}`);
@@ -374,6 +704,7 @@ function toggleEdit(el, p) {
       fields[i.dataset.f] = i.type === "checkbox" ? i.checked : i.value;
     });
     fields.pre_build_steps = area._getSteps();  // from the steps editor
+    Object.assign(fields, area._getTargeting());
     try { await api("PATCH", `/api/projects/${p.id}`, fields); await loadProjects(); }
     catch(e){ alert("Save failed: " + e.message); }
   };
@@ -449,13 +780,13 @@ let es = null;
 let currentBuildId = null;   // the build currently shown/streaming, for Stop
 function setState(s){ const el=$("state"); el.textContent=s; el.className=s.split(" ")[0]; }
 function showStop(on){ $("stopBuild").style.display = on ? "inline-block" : "none"; }
-async function startBuild(p) {
+async function startBuild(p, deviceIds) {
   $("buildCard").style.display="block";
   $("buildTitle").textContent = "Building: " + p.name;
   $("log").textContent=""; setState("submitting");
   $("buildCard").scrollIntoView({behavior:"smooth"});
   try {
-    const b = await api("POST", `/build/${p.id}`);
+    const b = await api("POST", `/build/${p.id}`, deviceIds ? { devices: deviceIds } : undefined);
     setState(b.state); stream(b.id);
   } catch(e){ setState("failed: " + e.message); }
 }
@@ -509,17 +840,17 @@ function stream(id) {
 }
 
 // Stream the device console into the log viewer (for runtime/addressables errors).
-function streamDeviceLogs(p) {
+function streamDeviceLogs(p, dev) {
   if (es) es.close();
   currentBuildId = null; showStop(false); stopProgress();
   liveLines = []; pending = []; truncatedCount = 0;
   $("fulllogwrap").style.display = "none"; $("timing").style.display = "none"; timingFor = null;
   $("buildCard").style.display = "block";
-  $("buildTitle").textContent = "Device logs: " + p.name;
+  $("buildTitle").textContent = "Device logs: " + p.name + (dev && devById(dev) ? " · " + devById(dev).name : "");
   $("log").textContent = "Launching the app on the phone with console attached… (unlock the phone)\n";
   setState("running");
   $("buildCard").scrollIntoView({behavior:"smooth"});
-  es = new EventSource(`/device-logs/${p.id}`);
+  es = new EventSource(`/device-logs/${p.id}?device=${encodeURIComponent(dev || "")}`);
   es.onmessage = e => { pending.push(e.data); scheduleFlush(); };
   es.addEventListener("done", e => { flushLog(); setState("idle"); es.close(); });
   es.onerror = () => {};
@@ -528,18 +859,18 @@ function streamDeviceLogs(p) {
 // Pull the LAST run's logs off the device WITHOUT relaunching the app, so a
 // crash or failure from a previous run is recoverable. Hits /device-logs-last,
 // which collects the unified log + any crash reports. Does not start the app.
-function streamLastRunLogs(p) {
+function streamLastRunLogs(p, dev) {
   if (es) es.close();
   currentBuildId = null; showStop(false); stopProgress();
   liveLines = []; pending = []; truncatedCount = 0;
   $("fulllogwrap").style.display = "none"; $("timing").style.display = "none"; timingFor = null;
   $("buildCard").style.display = "block";
-  $("buildTitle").textContent = "Last run logs: " + p.name;
+  $("buildTitle").textContent = "Last run logs: " + p.name + (dev && devById(dev) ? " · " + devById(dev).name : "");
   $("log").textContent = "Pulling the last run's logs from the phone (no relaunch)… "
     + "this can take ~15-30s while the unified log is collected. Keep the phone unlocked.\n";
   setState("running");
   $("buildCard").scrollIntoView({behavior:"smooth"});
-  es = new EventSource(`/device-logs-last/${p.id}`);
+  es = new EventSource(`/device-logs-last/${p.id}?device=${encodeURIComponent(dev || "")}`);
   es.onmessage = e => { pending.push(e.data); scheduleFlush(); };
   es.addEventListener("done", e => { flushLog(); setState("idle"); es.close(); });
   es.onerror = () => {};
@@ -786,7 +1117,8 @@ function allBuildRow(b) {
       <span class="badge">${esc(b.source)}</span>
     </div>
     ${idline}${labelline}
-    <div class="meta">${when}${dur} · ${esc(b.state)}${rc}</div>${actions}`;
+    <div class="meta">${when}${dur} · ${esc(b.state)}${rc}${
+      b.deploy && (b.device_names||[]).length ? " · → " + esc(b.device_names.join(", ")) : ""}</div>${actions}`;
   if (selectModeOn) {
     const cb = el.querySelector(".selbox");
     cb.onclick = (ev) => { ev.stopPropagation();
@@ -799,12 +1131,7 @@ function allBuildRow(b) {
     if (showActions) {
       // Stop button clicks from also opening the log view.
       const inst = el.querySelector('[data-a="install"]');
-      inst.onclick = async (ev) => { ev.stopPropagation();
-        inst.disabled = true; inst.textContent = "Installing…";
-        try { await api("POST", `/build/${b.project_id}/install/${b.id}`); refreshStatus(); }
-        catch(e){ alert("Install failed: " + e.message); }
-        finally { inst.disabled = false; inst.textContent = "📲 Install"; }
-      };
+      inst.onclick = (ev) => { ev.stopPropagation(); installTo(b.project_id, b.id, inst); };
       const dist = el.querySelector('[data-a="distribute"]');
       if (dist) dist.onclick = async (ev) => { ev.stopPropagation();
         if (!confirm("Upload this build to TestFlight / App Store Connect?")) return;
@@ -907,7 +1234,7 @@ function historyRow(b, active) {
     <div class="proj-head">
       <div><span class="${b.state}">${ICON[b.state]||"•"}</span>
            <b>${esc(b.project_name)}</b></div>
-      <span class="badge">${esc(b.source)}${b.deploy?" · deploy":""}</span>
+      <span class="badge">${esc(b.source)}${b.deploy ? " · → " + esc((b.device_names||[]).join(", ") || "defaults") : ""}</span>
     </div>
     <div class="meta">${esc(b.created_iso||"")} · ${esc(b.state)}${
       b.elapsed!=null ? " · " + fmtDur(b.elapsed) : ""}${
@@ -938,10 +1265,7 @@ function historyRow(b, active) {
     catch(e){ alert("Stop failed: " + e.message); }
   };
   const inst = el.querySelector('[data-a="install"]');
-  if (inst) inst.onclick = async () => {
-    try { await api("POST", `/build/${b.project_id}/install/${b.id}`); refreshStatus(); }
-    catch(e){ alert("Install failed: " + e.message); }
-  };
+  if (inst) inst.onclick = () => installTo(b.project_id, b.id, inst);
   const dist = el.querySelector('[data-a="distribute"]');
   if (dist) dist.onclick = async () => {
     if (!confirm("Export this build and upload it to TestFlight?")) return;
@@ -964,9 +1288,10 @@ function reattach(b) {
 }
 
 function esc(s){ return (s||"").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-loadProjects();
+loadProjects().then(() => loadDevices());
 refreshStatus();
 setInterval(refreshStatus, 4000);  // keep the page live without a reload
+setInterval(() => { if ($("picker").style.display === "none") loadDevices(); }, 15000);
 </script>
 </body>
 </html>

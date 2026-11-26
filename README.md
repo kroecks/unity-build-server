@@ -19,9 +19,9 @@ Open the UI, tap **+ Onboard a project**, and pick one of two ways:
    Unity projects are marked ●. Select one, give it a name, onboard.
 
 Then tap **Edit** on the project card and fill the three things the service
-can't infer: **Apple Team ID**, **Bundle ID**, and optionally a **Device UDID**
-(blank = build/archive only, no phone install). These are saved by the service
-in `config/projects.json` — still no script editing.
+can't infer: **Apple Team ID**, **Bundle ID**, and optionally which **devices**
+it deploys to (see [Devices](#devices); none = build/archive only). These are
+saved by the service in `config/projects.json` — still no script editing.
 
 > Why no native folder dialog? The UI is a web page shown on your phone; a
 > browser can't open a macOS file dialog on the mini. The "Browse the Mac" tab
@@ -30,11 +30,52 @@ in `config/projects.json` — still no script editing.
 
 ## Triggers
 
-- **Phone button**: tap Build on a project card. Deploys to the phone if a
-  device UDID is set and the phone is reachable; otherwise archives.
+- **Phone button**: tap Build on a project card. Installs to each of the
+  project's default targets that is online; otherwise archives. **Build to…**
+  picks the devices for just this run.
 - **Gitea webhook**: on push, the service matches the payload's repo URL to a
-  project and builds it. Webhook builds deploy to the phone only if you tick
-  "Deploy to phone on git push" for that project (off by default).
+  project and builds it. Webhook builds deploy to the default targets only if
+  you tick "Deploy to the default targets on git push" (off by default).
+- **Install** on a finished build opens a device picker and re-pushes the
+  artifact to the devices you tick, without rebuilding.
+
+## Devices
+
+The **Devices** panel lists every phone, tablet and headset the mini can see,
+scanned live (polled every 15 s, ↻ Scan to force):
+
+| Kind | Found via | Id |
+|------|-----------|----|
+| Quest | `adb devices -l` + `adb mdns services` (manufacturer "Oculus") | `ro.serialno` |
+| Android | same, any other maker | `ro.serialno` |
+| iPhone / iPad | `xcrun devicectl list devices` | hardware UDID |
+
+Ids are stable across USB/WiFi and port changes, so a headset keeps its
+nickname (✎) and stays a project's default target when it's offline. Known
+devices live in `devices.json` next to the project registry (`devices_path`
+in config.json to override).
+
+Per project (Edit):
+- **Device kinds** — what the project may install onto. Tick only *Quest* on a
+  Quest project and it can never land on an Android phone (the server rejects
+  it, even via the API); iOS projects choose iPhone and/or iPad.
+- **Default deploy targets** — one or more devices; Build / webhook deploys
+  install to each one that's online and skip (and log) the rest.
+
+**Quest over WiFi, no cable:** on the headset, Settings → System → Developer →
+Wireless debugging → *Pair device with pairing code*, then enter the address and
+code under Devices → **+ WiFi device** → Pair. Pair once; afterwards every scan
+finds it over mDNS and reconnects, even after a reboot (the connect port
+changes; the device id doesn't). Headsets in legacy `adb tcpip 5555` mode can be
+added with **Connect** instead; that mode resets on reboot and needs USB again.
+Keep a cable handy for first-time setup and when Meta OS updates break wireless
+debugging.
+
+API: `GET /api/devices[?refresh=1]`, `GET /api/projects/{id}/devices`,
+`PATCH`/`DELETE /api/devices/{id}`, `POST /api/devices/pair` `{address, code}`,
+`POST /api/devices/connect` `{address}`. `POST /build/{id}` and
+`POST /build/{id}/install/{build}` take an optional `{"devices": [ids]}`; log
+endpoints take `?device=<id>`.
 
 One global queue — only one Unity build runs at a time across all projects
 (two builds sharing a Library/ would corrupt it).

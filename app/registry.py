@@ -53,9 +53,18 @@ class Project:
     # Apple bits — the only things a human provides, once, via the form:
     development_team: str = ""          # 10-char Apple Team ID (iOS only)
     bundle_id: str = ""                 # iOS bundle id / Android package name
-    device_udid: str = ""               # iOS: target iPhone UDID. Android: adb
-                                        # serial (`adb devices`), or host:port for
-                                        # ADB-over-WiFi. Optional; blank = build only.
+    device_udid: str = ""               # LEGACY single target (iOS UDID / adb serial
+                                        # / host:port). Still honoured when
+                                        # deploy_devices is empty; the UI now edits
+                                        # deploy_devices instead.
+    # Device targeting (ids from the device inventory, app/devices.py):
+    # target_kinds limits which kinds of device this project may deploy to —
+    # e.g. ["quest"] so a Quest build never lands on an Android phone. Empty =
+    # every kind of the project's platform (ios: iphone+ipad; android: quest+android).
+    target_kinds: list = field(default_factory=list)
+    # Default deploy targets for Build / webhook deploys (several = install to
+    # each one that's online). Install and "Build to…" can pick others per run.
+    deploy_devices: list = field(default_factory=list)
     # Android-only. Keystore path + alias live here; the PASSWORDS do not — they
     # come from host config (config.json "android_keystores"), like the ASC key.
     # Blank keystore_path = Unity's debug keystore (fine for sideloading/Quest dev).

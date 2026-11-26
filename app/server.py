@@ -49,6 +49,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse, StreamingResponse,
 
 from .registry import Registry, Project, RegistryWriteError
 from . import onboarding
+from . import devices as devmod
 from .ui import INDEX_HTML
 
 # --------------------------------------------------------------------------- #
@@ -136,6 +137,9 @@ def _adb_path() -> str:
     return "adb"   # let it fail with a clear "command not found"
 
 reg = Registry(REGISTRY_PATH)
+# Device inventory (phones / tablets / headsets) — see app/devices.py.
+DEVICES_PATH = Path(CFG.get("devices_path", str(REGISTRY_PATH.parent / "devices.json"))).expanduser()
+DEVICES = devmod.DeviceStore(DEVICES_PATH, _adb_path)
 app = FastAPI(title="Unity Build Server")
 
 
@@ -173,6 +177,11 @@ class Build:
     # Timing breakdown: one entry per ">>> " phase header build.sh prints, with
     # its start offset (seconds since started_at). Durations are derived.
     phases: list = field(default_factory=list)
+    # Device ids picked for this run (empty = the project's default targets,
+    # resolved when the build actually runs). deployed_to records what was
+    # online and handed to the build script.
+    devices: list = field(default_factory=list)
+    deployed_to: list = field(default_factory=list)
 
     def duration(self) -> Optional[float]:
         if self.started_at is None:
@@ -205,6 +214,7 @@ class Build:
         d["commit_short"] = (self.commit_sha or "")[:8]
         d.pop("phases", None)
         d["timing"] = self.timing()
+        d["device_names"] = [_device_name(x) for x in (self.deployed_to or self.devices)]
         return d
 
     def timing(self) -> list:
@@ -240,7 +250,7 @@ def save_history() -> None:
                  "output_dir": b.output_dir, "artifact": b.artifact,
                  "version": b.version, "build_number": b.build_number,
                  "commit_sha": b.commit_sha, "label": b.label, "platform": b.platform,
-                 "phases": b.phases}
+                 "phases": b.phases, "devices": b.devices, "deployed_to": b.deployed_to}
                 for b in list(HISTORY)]
         tmp = HISTORY_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2))
@@ -261,7 +271,8 @@ def load_history() -> None:
                 ("id", "project_id", "project_name", "source", "deploy",
                  "state", "created_at", "started_at", "finished_at",
                  "returncode", "output_dir", "artifact",
-                 "version", "build_number", "commit_sha", "label", "platform", "phases")
+                 "version", "build_number", "commit_sha", "label", "platform", "phases",
+                 "devices", "deployed_to")
                 if k in rec}))
     except Exception:
         pass
@@ -308,6 +319,93 @@ def unity_breakdown(log_path: Path) -> list:
         return []
     rows = [{"name": k, "seconds": round(v, 1)} for k, v in totals.items() if v >= 0.5]
     return sorted(rows, key=lambda r: -r["seconds"])
+# --------------------------------------------------------------------------- #
+# Device targeting — which devices a project may / does deploy to
+# --------------------------------------------------------------------------- #
+
+
+def _device_name(dev_id: str) -> str:
+    d = DEVICES.get(dev_id)
+    return (d.get("name") or dev_id) if d else dev_id
+
+
+def allowed_kinds(p: Project) -> list[str]:
+    """Device kinds this project may deploy to. A Quest project with
+    target_kinds ["quest"] never installs onto an Android phone, and vice versa."""
+    plat = p.platform if p.platform in devmod.PLATFORM_KINDS else "ios"
+    every = devmod.PLATFORM_KINDS[plat]
+    ks = [k for k in (p.target_kinds or []) if k in every]
+    return ks or list(every)
+
+
+def is_compatible(p: Project, d: dict) -> bool:
+    plat = p.platform if p.platform in devmod.PLATFORM_KINDS else "ios"
+    return d.get("platform") == plat and d.get("kind") in allowed_kinds(p)
+
+
+def default_device_ids(p: Project) -> list[str]:
+    """The project's default targets. Falls back to the legacy single
+    device_udid (mapped to an inventory id when the device is known)."""
+    if p.deploy_devices:
+        return list(p.deploy_devices)
+    if p.device_udid:
+        d = DEVICES.find(p.device_udid)
+        return [d["id"] if d else p.device_udid]
+    return []
+
+
+def validate_device_ids(p: Project, ids) -> list[str]:
+    """Explicitly picked devices must exist and match the project's kinds."""
+    if ids is None:
+        return []
+    if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
+        raise HTTPException(status_code=400, detail="devices must be a list of device ids")
+    out = []
+    for x in ids:
+        d = DEVICES.get(x)
+        if not d:
+            raise HTTPException(status_code=400, detail=f"unknown device {x!r} — scan devices first")
+        if not is_compatible(p, d):
+            want = "/".join(devmod.KIND_LABEL.get(k, k) for k in allowed_kinds(p))
+            raise HTTPException(status_code=400, detail=(
+                f"{d.get('name')} is {'an' if str(d.get('kind_label','')).lower()[:1] in 'aeiou' else 'a'} "
+                f"{d.get('kind_label')}; {p.name} deploys to {want} only"))
+        if x not in out:
+            out.append(x)
+    return out
+
+
+async def resolve_deploy_targets(build: "Build", project: Project) -> tuple[list[str], list[str], list[str]]:
+    """At run time: (device ids, adb serials / UDIDs to hand the build script,
+    log notes). Offline or incompatible devices are skipped with a note, so one
+    headset being asleep never blocks the install to the others."""
+    ids = build.devices or default_device_ids(project)
+    notes: list[str] = []
+    if not ids:
+        return [], [], ["no deploy targets: pick devices on Install / Build to…, "
+                        "or set default targets in the project's settings"]
+    await DEVICES.scan(max_age=0)        # fresh: reconnects WiFi headsets too
+    ok_ids, transports = [], []
+    for x in ids:
+        d = DEVICES.get(x)
+        if d is None:
+            # Legacy raw serial / host:port the inventory hasn't identified yet:
+            # pass it through as before rather than silently dropping it.
+            if x == project.device_udid:
+                ok_ids.append(x); transports.append(x)
+                notes.append(f"{x}: not in the device inventory — trying it as given")
+            else:
+                notes.append(f"{x}: unknown device, skipped")
+            continue
+        label = f"{d.get('name')} ({d.get('kind_label')})"
+        if not is_compatible(project, d):
+            notes.append(f"{label}: not a target for this project, skipped")
+        elif not d.get("online"):
+            notes.append(f"{label}: {d.get('state') or 'offline'} — skipped (Install it later)")
+        else:
+            ok_ids.append(x); transports.append(d.get("transport") or d.get("udid") or x)
+            notes.append(f"{label}: online via {d.get('connection') or '?'} → {transports[-1]}")
+    return ok_ids, transports, notes
 
 
 async def run_build(build: Build, project: Project) -> None:
@@ -334,6 +432,12 @@ async def run_build(build: Build, project: Project) -> None:
     build_target, build_method = PLATFORMS[platform]
     store_pass, key_pass = (_keystore_passwords(project.keystore_path)
                             if platform == "android" else ("", ""))
+    # Deploy targets (install runs always deploy). Resolved now, not at enqueue,
+    # so a headset that woke up while the build was queued is still included.
+    target_notes: list[str] = []
+    transports: list[str] = []
+    if build.deploy and build.source != "distribute":
+        build.deployed_to, transports, target_notes = await resolve_deploy_targets(build, project)
     # Per-project parameters passed via env, never shell interpolation.
     env.update({
         "UBS_BUILD_ID": build.id,
@@ -355,7 +459,11 @@ async def run_build(build: Build, project: Project) -> None:
         "UBS_ADB": _adb_path() if platform == "android" else "",
         "UBS_DEVELOPMENT_TEAM": project.development_team,
         "UBS_BUNDLE_ID": project.bundle_id,
-        "UBS_DEVICE_UDID": project.device_udid,
+        # Every online target (space-separated adb serials / iOS UDIDs); the
+        # build script installs to each. UBS_DEVICE_UDID = the first, for
+        # single-device code paths.
+        "UBS_DEVICES": " ".join(transports),
+        "UBS_DEVICE_UDID": transports[0] if transports else "",
         "UBS_RECLAIM_DISK": "1" if project.reclaim_disk else "0",
         "UBS_CLEAN_IGNORED": "1" if project.clean_ignored else "0",
         "UBS_OUTPUT_DIR": str(out_dir),
@@ -387,6 +495,10 @@ async def run_build(build: Build, project: Project) -> None:
     global CURRENT_PROC
     with open(build.log_path, "w") as logf:
         logf.write(f"=== build {build.id} | {project.name} | {time.ctime()} ===\n")
+        if target_notes:
+            logf.write("=== deploy targets ===\n")
+            for n in target_notes:
+                logf.write(f"    {n}\n")
         logf.flush()
         try:
             # Launch in its own process group so cancel can kill Unity/xcodebuild
@@ -554,7 +666,8 @@ async def _startup() -> None:
     asyncio.create_task(worker_loop())
 
 
-def enqueue(project: Project, source: str, deploy: bool, coalesce: bool = False):
+def enqueue(project: Project, source: str, deploy: bool, coalesce: bool = False,
+            devices: Optional[list] = None):
     """Add a build to the queue. With coalesce=True (webhook pushes), if this
     project already has a build WAITING in the queue, don't add another — the
     pending build will fetch the latest origin state when it runs, so a second
@@ -568,9 +681,21 @@ def enqueue(project: Project, source: str, deploy: bool, coalesce: bool = False)
                 return None   # already a pending build for this project
     b = Build(id=uuid.uuid4().hex[:12], project_id=project.id,
               project_name=project.name, source=source, deploy=deploy,
-              platform=project.platform or "ios")
+              platform=project.platform or "ios", devices=list(devices or []))
     QUEUE.append(b); _wakeup.set()
     return b
+
+
+async def _json_body(request: Request) -> dict:
+    """Optional JSON body: {} when absent/empty (keeps old clients working)."""
+    raw = await request.body()
+    if not raw.strip():
+        return {}
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid json body")
+    return body if isinstance(body, dict) else {}
 
 
 def _check_token(token: str) -> None:
@@ -655,13 +780,25 @@ async def api_edit(project_id: str, request: Request, x_build_token: str = Heade
                "ccd_project_id", "ccd_environment", "ccd_bucket",
                "addressables_profile", "remote_build_path", "scripting_defines",
                "merge_from", "auto_distribute",
-               "platform", "android_build_aab", "keystore_path", "keystore_alias"}
+               "platform", "android_build_aab", "keystore_path", "keystore_alias",
+               "target_kinds", "deploy_devices"}
     fields = {k: v for k, v in body.items() if k in allowed}
     if "platform" in fields:
         fields["platform"] = _check_platform(fields["platform"])
-    proj = reg.update(project_id, **fields)
-    if not proj:
+    cur = reg.get(project_id)
+    if not cur:
         raise HTTPException(status_code=404, detail="no such project")
+    plat = fields.get("platform", cur.platform)
+    if "target_kinds" in fields:
+        tk = fields["target_kinds"]
+        every = devmod.PLATFORM_KINDS.get(plat, [])
+        if not isinstance(tk, list) or any(k not in every for k in tk):
+            raise HTTPException(status_code=400, detail=f"target_kinds must be a subset of {every}")
+    if "deploy_devices" in fields:
+        # Validate against the project AS IT WILL BE (new platform / kinds).
+        future = Project.from_record({**cur.public(), **fields})
+        fields["deploy_devices"] = validate_device_ids(future, fields["deploy_devices"])
+    proj = reg.update(project_id, **fields)
     return proj.public()
 
 
@@ -722,6 +859,121 @@ async def api_delete(project_id: str, delete_files: bool = Query(default=False),
 
 
 # --------------------------------------------------------------------------- #
+# Device inventory API
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/devices")
+async def api_devices(refresh: bool = Query(default=False)):
+    """Every known device with live state. Scans adb + devicectl (cached a few
+    seconds, so the UI can poll); refresh=1 forces a fresh scan."""
+    devs = await DEVICES.scan(max_age=0 if refresh else 5)
+    return {"devices": devs, "errors": DEVICES.last_errors,
+            "kinds": devmod.KIND_LABEL, "platform_kinds": devmod.PLATFORM_KINDS}
+
+
+@app.get("/api/projects/{project_id}/devices")
+async def api_project_devices(project_id: str, refresh: bool = Query(default=False)):
+    """Devices this project can deploy to (platform + target_kinds), online
+    first, with the project's defaults flagged — feeds the UI's device picker."""
+    proj = reg.get(project_id)
+    if not proj:
+        raise HTTPException(status_code=404, detail="no such project")
+    devs = await DEVICES.scan(max_age=0 if refresh else 5)
+    defaults = set(default_device_ids(proj))
+    out = [{**d, "default": d["id"] in defaults} for d in devs if is_compatible(proj, d)]
+    hidden = sum(1 for d in devs if not is_compatible(proj, d))
+    return {"devices": out, "allowed_kinds": allowed_kinds(proj),
+            "incompatible_count": hidden, "errors": DEVICES.last_errors}
+
+
+@app.patch("/api/devices/{dev_id}")
+async def api_device_rename(dev_id: str, request: Request, x_build_token: str = Header(default="")):
+    _check_token(x_build_token)
+    body = await _json_body(request)
+    d = DEVICES.rename(dev_id, str(body.get("name", "")))
+    if not d:
+        raise HTTPException(status_code=404, detail="no such device")
+    return d
+
+
+@app.delete("/api/devices/{dev_id}")
+async def api_device_forget(dev_id: str, x_build_token: str = Header(default="")):
+    """Forget a device (it reappears on the next scan if still attached).
+    Also drops it from every project's default targets."""
+    _check_token(x_build_token)
+    if not DEVICES.forget(dev_id):
+        raise HTTPException(status_code=404, detail="no such device")
+    for p in reg.list():
+        if dev_id in (p.deploy_devices or []):
+            reg.update(p.id, deploy_devices=[x for x in p.deploy_devices if x != dev_id])
+    return {"removed": True}
+
+
+def _check_address(addr: str) -> str:
+    addr = (addr or "").strip()
+    if not devmod.ADDRESS_RE.match(addr):
+        raise HTTPException(status_code=400, detail="address must look like 192.168.1.20:5555")
+    return addr
+
+
+@app.post("/api/devices/connect")
+async def api_device_connect(request: Request, x_build_token: str = Header(default="")):
+    """`adb connect ip:port` — for a headset already in tcpip mode, or one
+    that's paired for Wireless Debugging but not advertising over mDNS."""
+    _check_token(x_build_token)
+    addr = _check_address((await _json_body(request)).get("address", ""))
+    rc, out = await devmod._run([_adb_path(), "connect", addr], timeout=10)
+    devs = await DEVICES.scan(max_age=0)
+    ok = rc == 0 and ("connected" in out and "fail" not in out.lower())
+    return {"ok": ok, "output": out.strip(), "devices": devs}
+
+
+@app.post("/api/devices/pair")
+async def api_device_pair(request: Request, x_build_token: str = Header(default="")):
+    """`adb pair ip:port code` — one-time Wireless Debugging pairing. On the
+    headset/phone: Developer options → Wireless debugging → Pair device with
+    pairing code shows the address (its port is the PAIRING port, not the
+    connect port) and a 6-digit code. After this, the device is found by mDNS
+    and reconnected automatically on every scan, even after reboots."""
+    _check_token(x_build_token)
+    body = await _json_body(request)
+    addr = _check_address(body.get("address", ""))
+    code = str(body.get("code", "")).strip()
+    if not code.isdigit() or not 4 <= len(code) <= 10:
+        raise HTTPException(status_code=400, detail="pairing code is the 6 digits shown on the device")
+    rc, out = await devmod._run([_adb_path(), "pair", addr, code], timeout=20)
+    ok = rc == 0 and "Successfully paired" in out
+    devs = await DEVICES.scan(max_age=0) if ok else DEVICES.list()
+    return {"ok": ok, "output": out.strip(), "devices": devs}
+
+
+async def _log_target(proj: Project, device: str) -> str:
+    """The adb serial / UDID to read logs from: the picked device, else the
+    project's single online default. 4xx with a readable reason otherwise."""
+    if device:
+        d = DEVICES.get(device)
+        if not d or not is_compatible(proj, d):
+            raise HTTPException(status_code=400, detail="that device isn't a target for this project")
+    else:
+        ids = default_device_ids(proj)
+        if not ids:
+            raise HTTPException(status_code=404, detail="no device picked and no default target set")
+        await DEVICES.scan()
+        online = [DEVICES.get(x) for x in ids]
+        online = [d for d in online if d and d.get("online")]
+        if not online:
+            # Legacy raw serial the inventory doesn't know: use it as before.
+            if proj.device_udid and not DEVICES.find(proj.device_udid):
+                return proj.device_udid
+            raise HTTPException(status_code=409, detail="none of this project's target devices are online")
+        d = online[0]
+    await DEVICES.scan()
+    d = DEVICES.get(d["id"]) or d
+    return d.get("transport") or d.get("udid") or d["id"]
+
+
+# --------------------------------------------------------------------------- #
 # Server-side directory browser (folder picker over the MINI's filesystem)
 # --------------------------------------------------------------------------- #
 
@@ -757,14 +1009,17 @@ async def api_browse(path: str = Query(default=""), x_build_token: str = Header(
 
 
 @app.post("/build/{project_id}")
-async def trigger_build(project_id: str, x_build_token: str = Header(default=""),
+async def trigger_build(project_id: str, request: Request, x_build_token: str = Header(default=""),
                         deploy: Optional[bool] = Query(default=None)):
     _check_token(x_build_token)
     proj = reg.get(project_id)
     if not proj:
         raise HTTPException(status_code=404, detail="no such project")
     do_deploy = True if deploy is None else deploy
-    return JSONResponse(enqueue(proj, "phone", do_deploy).public())
+    # Optional body {"devices": [...]} — "Build to…" in the UI. Omitted = defaults.
+    body = await _json_body(request)
+    devs = validate_device_ids(proj, body.get("devices"))
+    return JSONResponse(enqueue(proj, "phone", do_deploy, devices=devs).public())
 
 
 @app.post("/cancel/{build_id}")
@@ -1077,8 +1332,8 @@ async def _sse_proc(cmd: list[str], cap_s: int = 0):
             except Exception: pass
 
 
-def _android_device_logs(proj: Project):
-    serial, pkg = proj.device_udid, proj.bundle_id
+def _android_device_logs(proj: Project, serial: str):
+    pkg = proj.bundle_id
 
     async def gen():
         note = await _adb_connect_if_wifi(serial)
@@ -1105,8 +1360,7 @@ def _android_device_logs(proj: Project):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-def _android_last_logs(proj: Project):
-    serial = proj.device_udid
+def _android_last_logs(proj: Project, serial: str):
 
     async def gen():
         yield "data: === Last-run logs from the device ring buffer (no relaunch) ===\n\n"
@@ -1129,9 +1383,9 @@ def _android_last_logs(proj: Project):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-async def _android_logs_zip(proj: Project):
+async def _android_logs_zip(proj: Project, serial: str):
     import tempfile, zipfile
-    serial, pkg = proj.device_udid, proj.bundle_id
+    pkg = proj.bundle_id
     work = tempfile.mkdtemp(prefix="logzip-")
     stamp = time.strftime("%Y%m%d-%H%M%S")
     manifest = [f"Unity build server — Android log bundle",
@@ -1175,16 +1429,17 @@ async def _android_logs_zip(proj: Project):
 
 
 @app.get("/device-logs/{project_id}")
-async def device_logs(project_id: str):
+async def device_logs(project_id: str, device: str = ""):
     """Stream the device console (xcrun devicectl) for a project's target device,
     so the app's runtime output (addressables errors, exceptions) is visible in
     the UI. Filtered to the app's process when possible. SSE, like build logs.
-    Android projects stream adb logcat instead."""
+    Android projects stream adb logcat instead. ?device=<id> picks the device."""
     proj = reg.get(project_id)
-    if not proj or not proj.device_udid:
-        raise HTTPException(status_code=404, detail="no project or no device UDID set")
+    if not proj:
+        raise HTTPException(status_code=404, detail="no such project")
+    target = await _log_target(proj, device)
     if proj.platform == "android":
-        return _android_device_logs(proj)
+        return _android_device_logs(proj, target)
 
     if not proj.bundle_id:
         raise HTTPException(status_code=400, detail="project has no bundle id to launch")
@@ -1198,7 +1453,7 @@ async def device_logs(project_id: str):
         # stdout/stderr (Unity Debug.Log). devicectl has no standalone console
         # command, so launching with --console is the supported way to see output.
         cmd = ["xcrun", "devicectl", "device", "process", "launch",
-               "--console", "--device", proj.device_udid, proj.bundle_id]
+               "--console", "--device", target, proj.bundle_id]
         yield f"data: launching {proj.bundle_id} with console attached…\n\n"
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1264,7 +1519,7 @@ async def _run_capture(cmd: list[str], timeout: int = 300) -> tuple[int, str]:
 
 
 @app.get("/device-logs-zip/{project_id}")
-async def device_logs_zip(project_id: str, minutes: int = 30):
+async def device_logs_zip(project_id: str, minutes: int = 30, device: str = ""):
     """Collect ALL last-run log sources into a single downloadable zip:
       - the app-written log file(s) from the data container (the full file, not
         the truncated live view),
@@ -1275,11 +1530,11 @@ async def device_logs_zip(project_id: str, minutes: int = 30):
     so it's a file download, not a stream. Does NOT relaunch the app.
     """
     proj = reg.get(project_id)
-    if not proj or not proj.device_udid:
-        raise HTTPException(status_code=404, detail="no project or no device UDID set")
+    if not proj:
+        raise HTTPException(status_code=404, detail="no such project")
+    udid = await _log_target(proj, device)
     if proj.platform == "android":
-        return await _android_logs_zip(proj)
-    udid = proj.device_udid
+        return await _android_logs_zip(proj, udid)
     proc_name = (getattr(proj, "device_process_name", "") or "").strip()
     if not proc_name and proj.bundle_id:
         proc_name = proj.bundle_id.split(".")[-1]
@@ -1395,7 +1650,7 @@ async def device_logs_zip(project_id: str, minutes: int = 30):
 
 
 @app.get("/device-logs-last/{project_id}")
-async def device_logs_last(project_id: str, minutes: int = 10):
+async def device_logs_last(project_id: str, minutes: int = 10, device: str = ""):
     """Retrieve the LAST run's logs from the device WITHOUT relaunching the app.
 
     Unlike /device-logs (which launches with --console and only shows the run it
@@ -1409,12 +1664,12 @@ async def device_logs_last(project_id: str, minutes: int = 10):
     the fact. Streamed as SSE so the (slow) `log collect` shows progress.
     """
     proj = reg.get(project_id)
-    if not proj or not proj.device_udid:
-        raise HTTPException(status_code=404, detail="no project or no device UDID set")
+    if not proj:
+        raise HTTPException(status_code=404, detail="no such project")
+    udid = await _log_target(proj, device)
     if proj.platform == "android":
-        return _android_last_logs(proj)
+        return _android_last_logs(proj, udid)
 
-    udid = proj.device_udid
     # Unity's player process name is the product name, not the bundle id. Default
     # to the bundle id's last path component if no explicit process name is set.
     proc_name = (getattr(proj, "device_process_name", "") or "").strip()
@@ -1664,15 +1919,22 @@ async def download_artifact(build_id: str):
 
 
 @app.post("/build/{project_id}/install/{build_id}")
-async def install_artifact(project_id: str, build_id: str, x_build_token: str = Header(default="")):
-    """Re-run a device install for an already-built artifact (phone reachable)."""
+async def install_artifact(project_id: str, build_id: str, request: Request,
+                           x_build_token: str = Header(default="")):
+    """Re-run a device install for an already-built artifact. Body
+    {"devices": [...]} picks the targets (the UI's device picker); omitted =
+    the project's defaults."""
     _check_token(x_build_token)
     proj = reg.get(project_id)
     b = find_build(build_id)
     if not proj or not b or not b.artifact:
         raise HTTPException(status_code=404, detail="no such project/build/artifact")
+    body = await _json_body(request)
+    devs = validate_device_ids(proj, body.get("devices"))
+    if not devs and not default_device_ids(proj):
+        raise HTTPException(status_code=400, detail="pick at least one device")
     # Enqueue a lightweight install-only build; the script sees UBS_INSTALL_ONLY.
-    nb = enqueue(proj, "install", True)
+    nb = enqueue(proj, "install", True, devices=devs)
     nb.artifact = b.artifact
     return JSONResponse(nb.public())
 
