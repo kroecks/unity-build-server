@@ -53,6 +53,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse, StreamingResponse,
 from .registry import Registry, Project, RegistryWriteError
 from . import onboarding
 from . import devices as devmod
+from . import repostatus
 from .ui import INDEX_HTML
 
 # --------------------------------------------------------------------------- #
@@ -572,10 +573,20 @@ async def run_build(build: Build, project: Project) -> None:
                 build.commit_sha = str(info.get("commit_sha", "") or build.commit_sha)
         except Exception:
             pass
+        # build-info.json is only written after Unity succeeds; commit.txt is
+        # written right after the git sync, so failed builds still say which
+        # commit they attempted.
+        if not build.commit_sha:
+            try:
+                build.commit_sha = (Path(build.output_dir) / "commit.txt").read_text().strip()[:12]
+            except OSError:
+                pass
     HISTORY.appendleft(build)
     save_history()
     prune_outputs(build.project_id)
     CURRENT = None
+    # The repo status panel compares against the last build; refresh it now.
+    schedule_repo_status(build.project_id, force=True)
     # Auto-distribute: a successful webhook build of a project that opted in gets
     # queued for TestFlight upload (only if ASC is configured). Never auto-distribute
     # install/distribute runs themselves, or manual/failed builds.
@@ -910,6 +921,9 @@ async def api_edit(project_id: str, request: Request, x_build_token: str = Heade
         future = Project.from_record({**cur.public(), **fields})
         fields["deploy_devices"] = validate_device_ids(future, fields["deploy_devices"])
     proj = reg.update(project_id, **fields)
+    if "branch" in fields or "merge_from" in fields:
+        REPO_STATUS.pop(project_id, None)      # compared against the wrong branches now
+        schedule_repo_status(project_id, force=True)
     return proj.public()
 
 
@@ -1205,7 +1219,12 @@ async def gitea_webhook(request: Request, x_gitea_signature: str = Header(defaul
     projs = reg.list_by_repo(repo_url)
     if not projs:
         return JSONResponse({"skipped": True, "reason": f"no project matches {repo_url}"})
-    results = [_webhook_for_project(p, branch) for p in projs]
+    after = str(payload.get("after") or "")
+    results = []
+    for p in projs:
+        r = _webhook_for_project(p, branch)
+        _record_hook(p.id, branch, after, r)
+        results.append(r)
     if len(results) == 1:
         return JSONResponse(results[0])
     return JSONResponse({"projects": results})
@@ -1238,6 +1257,135 @@ def _webhook_for_project(proj: Project, branch: str) -> dict:
                 "reason": "a build for this project is already queued; "
                           "it will pick up the latest commits"}
     return b.public()
+
+
+# --------------------------------------------------------------------------- #
+# Repo status: last build / last success / freshness vs origin + auto-sync parent
+# --------------------------------------------------------------------------- #
+
+# Last push webhook received per project, so the UI can tell "no push arrived"
+# (webhook never fired / failed to deliver) from "push arrived but was ignored".
+HOOKS_PATH = LOG_DIR / "webhooks.json"
+LAST_HOOKS: dict = {}
+try:
+    LAST_HOOKS = json.loads(HOOKS_PATH.read_text()) if HOOKS_PATH.exists() else {}
+except Exception:
+    LAST_HOOKS = {}
+
+
+def _record_hook(project_id: str, branch: str, after: str, result: dict) -> None:
+    if result.get("skipped"):
+        outcome = "ignored: " + str(result.get("reason", ""))
+    elif result.get("coalesced"):
+        outcome = "coalesced into the queued build"
+    else:
+        outcome = "queued build " + str(result.get("id", ""))
+    LAST_HOOKS[project_id] = {"time": time.time(), "branch": branch,
+                              "after": after[:40], "outcome": outcome[:200]}
+    try:
+        tmp = HOOKS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(LAST_HOOKS, indent=2))
+        os.replace(tmp, HOOKS_PATH)
+    except Exception:
+        pass
+
+
+REPO_STATUS: dict = {}                     # project id -> repostatus.compute() result
+REPO_STATUS_TASKS: "dict[str, asyncio.Task]" = {}
+REPO_STATUS_TTL = float(CFG.get("repo_status_ttl_s", 120))
+_repo_status_sem = asyncio.Semaphore(2)    # don't ls-remote every repo at once
+
+
+def _is_real_build(b: Build) -> bool:
+    return b.source not in ("install", "distribute")
+
+
+def build_summary(p: Project) -> dict:
+    """Last build / last successful build of a project, from history (newest first)."""
+    last = last_ok = None
+    for b in HISTORY:
+        if b.project_id != p.id or not _is_real_build(b):
+            continue
+        if last is None:
+            last = b
+        if b.state == "success":
+            last_ok = b
+            break
+    running = CURRENT if (CURRENT and CURRENT.project_id == p.id) else None
+    queued = [b for b in QUEUE if b.project_id == p.id]
+
+    def brief(b: Optional[Build]) -> Optional[dict]:
+        if not b:
+            return None
+        d = b.public()
+        return {k: d.get(k) for k in ("id", "state", "source", "created_at", "created_iso",
+                                      "finished_at", "elapsed", "version_label", "commit_short",
+                                      "has_artifact", "artifact_url", "label", "returncode")}
+    return {"last": brief(last), "last_success": brief(last_ok),
+            "running": brief(running), "queued": len(queued),
+            "last_hook": LAST_HOOKS.get(p.id)}
+
+
+async def _refresh_repo_status(p: Project) -> None:
+    built = ""
+    attempted = ""
+    for b in HISTORY:   # newest first; short shas are resolved by git
+        if b.project_id == p.id and _is_real_build(b) and b.commit_sha:
+            if not attempted:
+                attempted = b.commit_sha
+            if b.state == "success":
+                built = b.commit_sha
+                break
+    busy = bool(CURRENT and CURRENT.project_id == p.id)
+    async with _repo_status_sem:
+        try:
+            REPO_STATUS[p.id] = await repostatus.compute(
+                p.local_path, p.branch, p.merge_from, built_sha=built,
+                attempted_sha=attempted, allow_fetch=not busy)
+        except Exception as e:   # never let the panel take the server down
+            REPO_STATUS[p.id] = {"checked_at": time.time(), "error": f"status check failed: {e!r}"}
+
+
+def schedule_repo_status(project_id: str, force: bool = False) -> bool:
+    """Start a background refresh if the cached one is old (or force). Returns
+    True if a refresh is now running."""
+    t = REPO_STATUS_TASKS.get(project_id)
+    if t and not t.done():
+        return True
+    p = reg.get(project_id)
+    if not p or not p.ready:
+        return False
+    cached = REPO_STATUS.get(project_id)
+    if not force and cached and time.time() - cached.get("checked_at", 0) < REPO_STATUS_TTL:
+        return False
+    try:
+        t = asyncio.get_running_loop().create_task(_refresh_repo_status(p))
+    except RuntimeError:
+        return False
+    REPO_STATUS_TASKS[project_id] = t
+    return True
+
+
+@app.get("/api/projects/status")
+async def api_projects_status(refresh: bool = False, project_id: str = ""):
+    """Per-project status for the cards: build summary (live, from history) plus
+    the git freshness check (cached for REPO_STATUS_TTL seconds and refreshed in
+    the background — the response never waits on git). ?refresh=1 forces a
+    re-check; poll again a few seconds later to see the result."""
+    out = {}
+    for p in reg.list():
+        if project_id and p.id != project_id:
+            continue
+        if not p.ready:
+            continue
+        d = build_summary(p)
+        d["checking"] = schedule_repo_status(p.id, force=refresh)
+        d["git"] = REPO_STATUS.get(p.id)
+        d["branch"] = p.branch
+        d["merge_from"] = p.merge_from
+        d["trigger_branch"] = p.merge_from or p.branch
+        out[p.id] = d
+    return out
 
 
 def _disk_free_gb(path: Path) -> Optional[float]:
@@ -2110,14 +2258,32 @@ def _delete_one_build(b: "Build") -> bool:
 
 
 @app.get("/api/builds")
-async def list_builds(offset: int = 0, limit: int = 20, project_id: str = ""):
+async def list_builds(offset: int = 0, limit: int = 20, project_id: str = "", state: str = ""):
     """Paginated full build history (newest first). The UI pages through this;
-    /status still carries just the few most-recent for the live top view."""
-    items = [b for b in HISTORY if not project_id or b.project_id == project_id]
+    /status still carries just the few most-recent for the live top view.
+    state=success → only successful; state=failed → failed, cancelled or
+    interrupted; any other value → that exact state."""
+    bad = {"failed", "cancelled", "interrupted"}
+    def keep(b: Build) -> bool:
+        if project_id and b.project_id != project_id:
+            return False
+        if state == "failed":
+            return b.state in bad
+        return not state or b.state == state
+    items = [b for b in HISTORY if keep(b)]
     total = len(items)
     page = items[offset: offset + max(1, min(limit, 200))]
     return {"total": total, "offset": offset, "limit": limit,
             "builds": [b.public() for b in page]}
+
+
+@app.get("/api/builds/{build_id}")
+async def get_build(build_id: str):
+    """One build (for deep links: the UI opens #build=<id>)."""
+    b = find_build(build_id)
+    if not b:
+        raise HTTPException(status_code=404, detail="no such build")
+    return b.public()
 
 
 @app.patch("/api/builds/{build_id}")

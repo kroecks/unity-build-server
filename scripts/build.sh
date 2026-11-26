@@ -369,6 +369,10 @@ fi
 
 # Capture the commit actually being built (AFTER any merge), for build-info.json.
 BUILD_COMMIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo "")"
+# Also record it NOW (full sha), so a build that fails later in Unity/Xcode still
+# tells the server which commit it attempted — the repo-status panel uses this to
+# tell "built and failed" apart from "never attempted" (e.g. a missed webhook).
+mkdir -p "$OUTPUT_DIR" && git rev-parse HEAD > "$OUTPUT_DIR/commit.txt" 2>/dev/null || true
 
 # --- 1b. Install the build entry point AFTER the clean --------------------- #
 # The clean above wipes untracked files, so BuildScript.cs must be (re)written

@@ -46,6 +46,28 @@ saved by the service in `config/projects.json` — still no script editing.
 - **Install** on a finished build opens a device picker and re-pushes the
   artifact to the devices you tick, without rebuilding.
 
+## Project status (on each card)
+
+Each project card shows, at a glance:
+- **Last build** and **last success** — tap either to open its log (links are
+  `#build=<id>`, so they can be bookmarked/shared); ⤓ downloads the artifact.
+- **origin/<branch>** tip, and for auto-sync projects (`merge_from`) whether the
+  parent's tip is already in the branch's history (**in sync**) or how many of
+  its commits aren't merged yet.
+- **Up to date / N commits not built** — commits on origin (branch + parent)
+  missing from the last *successful* build. Merge commits are ignored, so a
+  branch you re-synced by hand (same content, different sha) counts as up to date.
+- **Last push** — the last Gitea webhook received for the project. If origin has
+  newer commits than the last webhook, the card says the hook may have failed
+  and offers **Build now**.
+- A warning when the clone on the mini has local commits that aren't on origin
+  (the next build's `reset --hard` would discard them).
+
+Remote tips come from `git ls-remote`; missing objects are fetched into
+`refs/ubs-status/*` (never `origin/*`), skipped while that project is building.
+Results are cached for `repo_status_ttl_s` (default 120 s); ↻ check forces one.
+API: `GET /api/projects/status[?refresh=1]`, `GET /api/builds/{id}`.
+
 ## Devices
 
 The **Devices** panel lists every phone, tablet and headset the mini can see,

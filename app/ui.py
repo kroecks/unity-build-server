@@ -87,6 +87,38 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .kinds { display:flex; gap:14px; flex-wrap:wrap; }
   .kinds label { display:flex; align-items:center; gap:6px; margin:4px 0; }
   .kinds input { width:auto; }
+  /* collapsible section header */
+  button.collapser { background:transparent; padding:4px 2px; font-size:15px; font-weight:600; color:inherit; opacity:.9; }
+  .collapser .caret { display:inline-block; width:1em; transition:transform .15s; }
+  .collapser[aria-expanded="true"] .caret { transform:rotate(90deg); }
+  .collapser .hint { font-weight:400; margin-left:4px; }
+  .proj-toggle { flex:1; min-width:0; text-align:left; padding:2px 0; white-space:nowrap;
+                 overflow:hidden; text-overflow:ellipsis; }
+  .build-btn { padding:8px 16px; flex:0 0 auto; }
+  .sum-badges { margin-top:6px; display:flex; flex-wrap:wrap; gap:4px; }
+  .sum-badges [data-sumbadges] { display:contents; }
+  /* repo status block on a project card */
+  .st { margin-top:10px; border-top:1px solid #2a2f3a; padding-top:8px; font-size:13px; }
+  .st-head { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:4px; }
+  .st-row { display:grid; grid-template-columns: 96px 1fr; gap:2px 8px; padding:3px 0; align-items:baseline; }
+  .st-row .k { opacity:.6; font-size:12px; white-space:nowrap; }
+  .st-row .v { min-width:0; overflow-wrap:anywhere; }
+  .st a { color:#93c5fd; text-decoration:none; }
+  .st a:hover { text-decoration:underline; }
+  .sha { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:#93c5fd; }
+  .subj { opacity:.75; }
+  .badge.bad { background:#7f1d1d; color:#fecaca; }
+  .badge.run { background:#1e3a8a; color:#bfdbfe; }
+  .badge.amber { background:#78350f; color:#fde68a; }
+  .st-alert { margin-top:6px; padding:7px 9px; border-radius:8px; font-size:12px;
+              background:#3b2a0b; color:#fde68a; }
+  .st-alert.red { background:#3f1212; color:#fecaca; }
+  .st-alert button { padding:4px 9px; font-size:12px; margin-left:6px; }
+  .st details summary { cursor:pointer; opacity:.7; font-size:12px; padding:2px 0; }
+  .st ul { margin:4px 0 0 0; padding-left:18px; font-size:12px; }
+  .st-foot { display:flex; justify-content:space-between; align-items:center; margin-top:4px;
+             font-size:11px; opacity:.55; }
+  .st-foot button { padding:2px 8px; font-size:11px; background:transparent; color:inherit; border:1px solid #2a2f3a; }
 </style>
 </head>
 <body>
@@ -101,13 +133,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="logbar" style="margin-top:4px">
-    <h2 style="margin:0">Devices</h2>
+    <h2 style="margin:0"><button class="sec collapser" id="devToggle" aria-expanded="false" aria-controls="devSection">
+      <span class="caret">▸</span> Devices <span class="hint" id="devSummary"></span></button></h2>
     <span>
       <button class="sec" id="toggleAddDev" title="Pair / connect a device over WiFi">+ WiFi device</button>
       <button class="sec" id="scanDevices">↻ Scan</button>
     </span>
   </div>
+  <div id="devSection" style="display:none">
   <div class="card" id="devices" style="padding:4px 12px"><div class="meta">Scanning…</div></div>
+  </div>
   <div class="card" id="addDevPanel" style="display:none">
     <b>Add a device over WiFi</b>
     <div class="meta" style="margin-top:6px">
@@ -215,6 +250,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="sec" id="selectCancel">Cancel</button>
     </span>
   </div>
+  <div class="row" id="buildFilters" style="margin-bottom:8px">
+    <select id="fProject" aria-label="Filter by project"><option value="">All projects</option></select>
+    <select id="fState" aria-label="Filter by result">
+      <option value="">All results</option>
+      <option value="success">✓ Successful</option>
+      <option value="failed">✕ Failed / cancelled</option>
+    </select>
+  </div>
   <div id="allbuilds"></div>
   <button class="sec full" id="loadMore" style="display:none; margin-top:8px">Load more</button>
 
@@ -302,6 +345,9 @@ async function loadDevices(refresh) {
 }
 function renderDevices() {
   if (!DEVS_LOADED) return;
+  const on = DEVS.filter(d => d.online).length;
+  $("devSummary").textContent = DEVS.length
+    ? `· ${DEVS.length} known · ${on} online` + (DEV_ERRORS.length ? " · ⚠" : "") : "· none yet";
   const wrap = $("devices"); wrap.innerHTML = "";
   if (!DEVS.length) {
     wrap.innerHTML = `<div class="meta" style="padding:8px 0">No devices yet. Plug one in over USB
@@ -345,6 +391,15 @@ $("scanDevices").onclick = async () => {
 $("toggleAddDev").onclick = () => {
   const p = $("addDevPanel"); p.style.display = p.style.display === "none" ? "block" : "none";
 };
+// Devices list is collapsible (it gets tall with a few headsets); the choice is
+// remembered on this device. Collapsed by default — the header shows the counts.
+function setDevOpen(open) {
+  $("devSection").style.display = open ? "block" : "none";
+  $("devToggle").setAttribute("aria-expanded", open ? "true" : "false");
+  try { localStorage.setItem("ubs_devices_open", open ? "1" : "0"); } catch(e) {}
+}
+$("devToggle").onclick = () => setDevOpen($("devSection").style.display === "none");
+setDevOpen((() => { try { return localStorage.getItem("ubs_devices_open") === "1"; } catch(e) { return false; } })());
 async function devWifi(kind) {
   const body = { address: $("devAddr").value.trim() };
   if (kind === "pair") body.code = $("devCode").value.trim();
@@ -459,6 +514,7 @@ async function loadProjects() {
   if (!projs.length) { wrap.innerHTML = '<div class="card meta">No projects yet. Onboard one below.</div>'; return; }
   for (const p of projs) wrap.appendChild(p.onboard_state ? onboardingCard(p) : projectCard(p));
   renderDevices();   // refresh the "default for" lines
+  fillProjectFilter();
   scheduleOnboardPoll();
 }
 
@@ -553,17 +609,21 @@ function projectCard(p) {
     ? `<span class="badge ok">build script ✓</span>` : `<span class="badge warn">no build script</span>`;
   el.innerHTML = `
     <div class="proj-head">
-      <div class="proj-name">${esc(p.name)}</div>
-      <div>${platBadge} ${versionBadge} ${scriptBadge}</div>
+      <button class="sec collapser proj-toggle" data-act="toggle" aria-expanded="false" title="Show / hide details">
+        <span class="caret">▸</span> <span class="proj-name">${esc(p.name)}</span></button>
+      <button data-act="build" class="build-btn" ${needs.length?"disabled":""}>Build${needs.length?" (configure first)":""}</button>
     </div>
+    <div class="sum-badges">${platBadge} <span data-sumbadges="${p.id}">${summaryBadges(p)}</span></div>
+    <div class="proj-body" style="display:none">
+    <div style="margin-top:8px">${versionBadge} ${scriptBadge}</div>
     <div class="meta">${esc(p.repo_url)} · ${esc(p.branch)}${
       isAndroid(p) ? " · " + (p.android_build_aab ? "AAB" : "APK")
                    + (p.keystore_path ? " · release-signed" : " · debug-signed") : ""}</div>
     <div class="meta">${esc(p.local_path)}</div>
     ${needs.length ? `<div class="meta" style="color:#fbbf24">Needs: ${needs.join(", ")} — tap Edit</div>` : ""}
     <div data-chips="${p.id}" style="margin-top:6px">${chipsHtml(p)}</div>
+    <div class="st" data-status="${p.id}">${statusHtml(p)}</div>
     <div class="btn-row">
-      <button data-act="build" ${needs.length?"disabled":""}>Build${needs.length?" (configure first)":""}</button>
       <button class="sec" data-act="buildto" ${needs.length?"disabled":""} title="Build and install to devices you pick">Build to…</button>
       <button class="sec" data-act="edit">Edit</button>
     </div>
@@ -572,13 +632,23 @@ function projectCard(p) {
       <button class="sec" data-act="lastlogs">Last run logs</button>
       <button class="sec" data-act="logzip" title="Download all log sources as a zip">⤓ Logs zip</button>
     </div>
-    <div class="editArea" style="display:none"></div>`;
-  el.querySelector('[data-act="build"]').onclick = () => startBuild(p);
+    <div class="editArea" style="display:none"></div>
+    </div>`;
+  const body = el.querySelector(".proj-body"), tog = el.querySelector('[data-act="toggle"]');
+  const setOpen = open => {
+    body.style.display = open ? "block" : "none";
+    tog.setAttribute("aria-expanded", open ? "true" : "false");
+    try { localStorage.setItem("ubs_open_" + p.id, open ? "1" : "0"); } catch(e) {}
+  };
+  tog.onclick = () => setOpen(body.style.display === "none");
+  setOpen((() => { try { return localStorage.getItem("ubs_open_" + p.id) === "1"; } catch(e) { return false; } })());
+  el.querySelector('[data-act="build"]').onclick = (ev) => { ev.stopPropagation(); startBuild(p); };
   el.querySelector('[data-act="buildto"]').onclick = async () => {
     const ids = await pickDevices(p, { title: "Build and install to…", go: "Build & install" });
     if (ids && ids.length) startBuild(p, ids);
   };
   el.querySelector('[data-act="edit"]').onclick = () => toggleEdit(el, p);
+  wireStatus(el, p);
   // Logs read from ONE device: auto-picked when only one is online.
   const logDev = async () => {
     const ids = await pickDevices(p, { title: "Logs from which device?", go: "Show logs", multi: false });
@@ -916,6 +986,7 @@ function stream(id) {
   es.addEventListener("done", e => {
     flushLog(); setState(e.data); es.close(); showStop(false); stopProgress(); refreshStatus();
     loadTiming(id);
+    setTimeout(() => loadProjectStatus(false), 1500);   // card: new last build + freshness
   });
   es.onerror = () => {};
 }
@@ -1148,7 +1219,10 @@ const PAGE = 20;
 async function loadAllBuilds(reset) {
   if (reset) { allOffset = 0; allLoaded = []; }
   let data;
-  try { data = await api("GET", `/api/builds?offset=${allOffset}&limit=${PAGE}`); }
+  const q = new URLSearchParams({ offset: allOffset, limit: PAGE });
+  if ($("fProject").value) q.set("project_id", $("fProject").value);
+  if ($("fState").value) q.set("state", $("fState").value);
+  try { data = await api("GET", `/api/builds?${q}`); }
   catch(e){ return; }
   allTotal = data.total;
   if (reset) allLoaded = data.builds;
@@ -1157,7 +1231,8 @@ async function loadAllBuilds(reset) {
 }
 function renderAllBuilds() {
   const wrap = $("allbuilds"); wrap.innerHTML = "";
-  if (!allLoaded.length) { wrap.innerHTML = '<div class="card meta">No builds yet.</div>'; }
+  const filtered = $("fProject").value || $("fState").value;
+  if (!allLoaded.length) { wrap.innerHTML = `<div class="card meta">${filtered ? "No builds match these filters." : "No builds yet."}</div>`; }
   for (const b of allLoaded) wrap.appendChild(allBuildRow(b));
   $("loadMore").style.display = allLoaded.length < allTotal ? "block" : "none";
   $("loadMore").textContent = `Load more (${allLoaded.length} of ${allTotal})`;
@@ -1238,6 +1313,17 @@ function allBuildRow(b) {
   return el;
 }
 $("loadMore").onclick = () => { allOffset += PAGE; loadAllBuilds(false); };
+// Filters: remembered on this device; the project list follows the registry.
+function fillProjectFilter() {
+  const sel = $("fProject"), shown = sel.value, want = sel.value || (() => { try { return localStorage.getItem("ubs_f_project") || ""; } catch(e) { return ""; } })();
+  sel.innerHTML = `<option value="">All projects</option>` +
+    PROJS.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
+  sel.value = PROJS.some(p => p.id === want) ? want : "";
+  if (sel.value !== shown) loadAllBuilds(true);
+}
+try { $("fState").value = localStorage.getItem("ubs_f_state") || ""; } catch(e) {}
+for (const [id, key] of [["fProject", "ubs_f_project"], ["fState", "ubs_f_state"]])
+  $(id).onchange = () => { try { localStorage.setItem(key, $(id).value); } catch(e) {} loadAllBuilds(true); };
 
 // ---- storage panel: disk free + per-project build sizes ----------------- //
 function gb(n){ return (n==null) ? "?" : n.toFixed(n<10?2:1)+" GB"; }
@@ -1368,8 +1454,193 @@ function reattach(b) {
   stream(b.id);
 }
 
+
+// ---- per-project repo status ---------------------------------------------- //
+// /api/projects/status: last build + last success (live from history) and a
+// cached git check — origin tips, auto-sync parent, unpushed local commits,
+// last webhook received. Cheap to poll; git runs in the background server-side.
+let PSTATUS = {};
+let pstatusTimer = null;
+async function loadProjectStatus(refresh) {
+  clearTimeout(pstatusTimer);
+  try {
+    PSTATUS = await (await fetch("/api/projects/status" + (refresh ? "?refresh=1" : ""))).json();
+  } catch(e) {}
+  for (const p of PROJS) {
+    if (p.onboard_state) continue;
+    const box = document.querySelector(`[data-status="${p.id}"]`);
+    if (!box) continue;
+    const open = [...box.querySelectorAll("details")].map(d => d.open);
+    box.innerHTML = statusHtml(p);
+    const sb = document.querySelector(`[data-sumbadges="${p.id}"]`);
+    if (sb) sb.innerHTML = summaryBadges(p);
+    box.querySelectorAll("details").forEach((d, i) => { if (open[i]) d.open = true; });
+    wireStatus(box.closest(".card"), p);
+  }
+  // Re-poll sooner while a git check is in flight, otherwise every 20 s.
+  const checking = Object.values(PSTATUS).some(s => s.checking);
+  pstatusTimer = setTimeout(() => loadProjectStatus(false), checking ? 2500 : 20000);
+}
+const buildLink = (b, text) => `<a href="#build=${encodeURIComponent(b.id)}" title="Open this build's log">${text}</a>`;
+const shaHtml = c => c ? `<span class="sha">${esc(c.short || (c.sha||"").slice(0,8))}</span>` : "";
+const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+function commitList(items, more) {
+  if (!items || !items.length) return "";
+  return `<ul>${items.map(c => `<li><span class="sha">${esc(c.short)}</span> ${esc(c.subject)}
+    <span class="hint">· ${esc(c.author)} · ${c.time ? ago(c.time) : ""}</span></li>`).join("")}${
+    more > items.length ? `<li class="hint">…and ${more - items.length} more</li>` : ""}</ul>`;
+}
+function buildLine(b, okText) {
+  if (!b) return `<span class="hint">none in history</span>`;
+  const icon = `<span class="${b.state}">${ICON[b.state] || "•"}</span>`;
+  const bits = [ago(b.finished_at || b.created_at)];
+  if (b.version_label) bits.push(esc(b.version_label));
+  if (b.commit_short) bits.push(`<span class="sha">${esc(b.commit_short)}</span>`);
+  bits.push(esc(b.source));
+  return `${icon} ${buildLink(b, okText || esc(b.state))} <span class="hint">· ${bits.join(" · ")}</span>${
+    b.has_artifact ? ` · <a href="${b.artifact_url}" title="Download the artifact">⤓</a>` : ""}`;
+}
+
+// Decide the two headline badges: build health and freshness.
+function statusModel(p) {
+  const s = PSTATUS[p.id];
+  const m = { buildBadge:"", freshBadge:"", alerts:[] };
+  if (!s) return m;
+  const g = s.git || null;
+  // Build health
+  if (s.running) m.buildBadge = `<span class="badge run">● building now</span>`;
+  else if (s.queued) m.buildBadge = `<span class="badge run">… queued</span>`;
+  else if (!s.last) m.buildBadge = `<span class="badge">never built</span>`;
+  else if (s.last.state === "success") m.buildBadge = `<span class="badge ok">✓ last build passed</span>`;
+  else m.buildBadge = `<span class="badge bad">${ICON[s.last.state]||"✕"} last build ${esc(s.last.state)}</span>`;
+  if (s.last && !s.running && !s.queued)
+    m.buildBadge = m.buildBadge.replace("</span>", ` · ${ago(s.last.finished_at || s.last.created_at)}</span>`);
+
+  // Freshness (needs the git check)
+  if (!g) { m.freshBadge = `<span class="badge">${s.checking ? "checking git…" : "freshness unknown"}</span>`; return m; }
+  if (g.error) { m.freshBadge = `<span class="badge warn">git: ${esc(g.error)}</span>`; return m; }
+  const built = g.built, par = g.parent;
+  if (!built) {
+    m.freshBadge = `<span class="badge amber">no successful build to compare</span>`;
+  } else if (built.unknown) {
+    m.freshBadge = `<span class="badge">built commit ${esc(built.short)} not in this clone</span>`;
+  } else if (built.current) {
+    m.freshBadge = `<span class="badge ok">✓ up to date</span>`;
+  } else {
+    m.freshBadge = `<span class="badge amber" title="commits on origin missing from the last successful build">⚠ ${plural(built.behind_no_merges, "commit")} behind</span>`;
+  }
+
+  // Is newer work sitting on the trigger branch with no push received for it?
+  // (Gitea webhooks sometimes fail to deliver.) Commits newer than the last
+  // hook we received — and nothing queued/running — means the hook went missing.
+  const pend = (built && !built.current && built.pending) || [];
+  const newest = pend.length ? Math.max(...pend.map(c => c.time || 0)) : 0;
+  const hook = s.last_hook;
+  const attemptedCurrent = g.attempted && g.attempted.current;
+  if (newest && !s.running && !s.queued) {
+    if (attemptedCurrent && s.last && s.last.state !== "success") {
+      m.alerts.push({cls:"red", html:`The newest commits were built but the build <b>${esc(s.last.state)}</b> — ${buildLink(s.last, "see the log")}.`});
+    } else if (!hook || hook.time < newest - 30) {
+      m.alerts.push({cls:"", act:"build", html:`No push webhook received since ${
+        hook ? ago(hook.time) : "the server started tracking"} — newer commits on <b>${esc(s.trigger_branch)}</b> (${ago(newest)}) were never built. The hook may have failed to send.`});
+    } else if (hook && hook.outcome.startsWith("ignored")) {
+      m.alerts.push({cls:"", act:"build", html:`Last push (${ago(hook.time)}, <b>${esc(hook.branch)}</b>) was ${esc(hook.outcome)}.`});
+    }
+  }
+  // Parent commits not on origin/<branch> but already in the build: the build's
+  // merge-back push didn't land. (When the build is ALSO behind, the "not built"
+  // badge and the auto-sync row already explain it.)
+  if (par && par.behind && built && built.current) {
+    m.alerts.push({cls:"", html:`The last build included <b>${esc(par.name)}</b>, but origin/${esc(g.branch ? g.branch.name : p.branch)} doesn't contain it yet — the merge-back push may have failed.`});
+  }
+  const loc = g.local || {};
+  if (loc.unpushed) {
+    m.alerts.push({cls:"red", html:`The clone on the Mac has ${plural(loc.unpushed, "local commit")} on <b>${esc(p.branch)}</b> that ${loc.unpushed === 1 ? "isn't" : "aren't"} on origin. The next build resets to origin/${esc(p.branch)} and will discard ${loc.unpushed === 1 ? "it" : "them"} — push first.${commitList(loc.unpushed_commits, loc.unpushed)}`});
+  }
+  return m;
+}
+
+// Collapsed-card summary: build health + how far behind origin, plus a ⚠ when
+// an alert (missed webhook, unpushed local commits…) is waiting inside.
+function summaryBadges(p) {
+  if (!PSTATUS[p.id]) return `<span class="badge">loading…</span>`;
+  const m = statusModel(p);
+  const n = m.alerts.length;
+  return `${m.buildBadge} ${m.freshBadge}${n ? ` <span class="badge warn" title="open the card for details">⚠ ${n}</span>` : ""}`;
+}
+function statusHtml(p) {
+  const s = PSTATUS[p.id];
+  if (!s) return `<div class="hint">Loading status…</div>`;
+  const g = s.git || {};
+  const m = statusModel(p);
+  const rows = [];
+  if (s.running) rows.push(["Building", `${buildLink(s.running, "watch live")} <span class="hint">· started ${ago(s.running.created_at)}</span>`]);
+  rows.push(["Last build", buildLine(s.last)]);
+  if (!s.last || s.last.state !== "success" || (s.last_success && s.last_success.id !== s.last.id))
+    rows.push(["Last success", buildLine(s.last_success, "passed")]);
+
+  const br = g.branch;
+  if (br) rows.push([`origin/${esc(br.name)}`, `${shaHtml(br)} ${br.subject ? `<span class="subj">${esc(br.subject)}</span>` : ""}
+      ${br.time ? `<span class="hint">· ${ago(br.time)}</span>` : ""}${br.unfetched ? ` <span class="hint">(not fetched yet)</span>` : ""}`]);
+  const par = g.parent, built = g.built;
+  if (par) {
+    let v;
+    if (par.in_sync === true) v = `<span class="success">✓ in sync</span> <span class="hint">· ${shaHtml(par)} is in ${esc(p.branch)}'s history${
+      par.branch_only ? ` · ${esc(p.branch)} has ${plural(par.branch_only, "own commit")}` : ""}</span>`;
+    else if (par.in_sync === false) v = `<span class="queued">⚠ ${plural(par.behind_no_merges || par.behind, "commit")} not merged into ${esc(p.branch)}${
+      built && !built.current && built.behind_no_merges === (par.behind_no_merges || par.behind) ? " or built" : ""}</span>
+      <span class="hint">· tip ${shaHtml(par)} ${par.time ? ago(par.time) : ""}</span>
+      <details><summary>show</summary>${commitList(par.pending, par.behind_no_merges || par.behind)}</details>`;
+    else v = `<span class="hint">${par.unfetched ? "not fetched yet" : "unknown"}</span>`;
+    rows.push([`<span title="auto-sync parent: merged into ${esc(p.branch)} before each build">↳ ${esc(par.name)}</span>`, v]);
+  } else if (p.merge_from) {
+    rows.push([`↳ ${esc(p.merge_from)}`, `<span class="hint">${s.checking ? "checking…" : "unknown"}</span>`]);
+  }
+  // Skip the list when it's just the parent's unmerged commits shown again above.
+  const sameAsParent = par && par.behind && built && built.behind_no_merges === par.behind_no_merges;
+  if (built && !built.current && !built.unknown && !sameAsParent) {
+    rows.push(["Not built yet", `${plural(built.behind_no_merges, "commit")}<details><summary>show</summary>${commitList(built.pending, built.behind_no_merges)}</details>`]);
+  }
+  const hook = s.last_hook;
+  rows.push(["Last push", hook
+    ? `${esc(hook.branch || "?")} ${hook.after ? `<span class="sha">${esc(hook.after.slice(0,8))}</span>` : ""} <span class="hint">· ${ago(hook.time)} · ${esc(hook.outcome)}</span>`
+    : `<span class="hint">no webhook received yet (triggers on ${esc(s.trigger_branch)})</span>`]);
+
+  const alerts = m.alerts.map(a => `<div class="st-alert ${a.cls}">${a.html}${
+    a.act === "build" ? `<button data-act="stbuild">Build now</button>` : ""}</div>`).join("");
+  const notes = (g.notes || []).map(n => `<div class="hint" style="color:#fbbf24">${esc(n)}</div>`).join("");
+  return `
+    ${rows.map(([k, v]) => `<div class="st-row"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("")}
+    ${alerts}${notes}
+    <div class="st-foot"><span>${g.checked_at ? "git checked " + ago(g.checked_at) + (g.source === "last-fetch" ? " (offline)" : "") : ""}${s.checking ? " · checking…" : ""}</span>
+      <button data-act="strefresh" title="Re-check origin now">↻ check</button></div>`;
+}
+function wireStatus(el, p) {
+  if (!el) return;
+  const r = el.querySelector('[data-act="strefresh"]');
+  if (r) r.onclick = (ev) => { ev.stopPropagation(); r.disabled = true; r.textContent = "checking…"; loadProjectStatus(true); };
+  const b = el.querySelector('[data-act="stbuild"]');
+  if (b) b.onclick = (ev) => { ev.stopPropagation(); startBuild(p); };
+}
+
+// ---- deep links: #build=<id> opens that build's log ----------------------- //
+async function openBuildFromHash() {
+  const m = location.hash.match(/^#build=([\w-]+)/);
+  if (!m) return;
+  try {
+    const b = await api("GET", `/api/builds/${m[1]}`);
+    (b.state === "running" || b.state === "queued") ? reattach(b) : viewLog(b);
+  } catch(e) { alert("Build not found: " + e.message); }
+}
+window.addEventListener("hashchange", openBuildFromHash);
+// Re-tapping the link that's already in the URL doesn't fire hashchange.
+document.addEventListener("click", ev => {
+  const a = ev.target.closest('a[href^="#build="]');
+  if (a && a.getAttribute("href") === location.hash) { ev.preventDefault(); openBuildFromHash(); }
+});
+
 function esc(s){ return (s||"").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-loadProjects().then(() => loadDevices());
+loadProjects().then(() => { loadDevices(); loadProjectStatus(false); openBuildFromHash(); });
 refreshStatus();
 setInterval(refreshStatus, 4000);  // keep the page live without a reload
 setInterval(() => { if ($("picker").style.display === "none") loadDevices(); }, 15000);
