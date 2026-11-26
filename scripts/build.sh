@@ -288,7 +288,12 @@ if ! git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null; then
   git branch -r --format='    %(refname:short)' >&2 || true
   exit 1
 fi
-git checkout -B "$BRANCH" "origin/$BRANCH"
+# -f: this dir is a disposable mirror, so discard local edits / untracked files
+# that are "in the way" instead of refusing. Without it, a file Unity modified
+# that upstream later deleted (or untracked + gitignored) blocks the checkout
+# with "would be overwritten", and the reset below never gets to run.
+git merge --abort 2>/dev/null || true
+git checkout -f -B "$BRANCH" "origin/$BRANCH"
 git reset --hard "origin/$BRANCH"
 if [[ "${UBS_CLEAN_IGNORED:-0}" == "1" ]]; then
   git clean -fdx   # removes Library/ too — slow next build
