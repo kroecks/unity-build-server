@@ -149,7 +149,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <label>Platform</label>
       <select id="clonePlatform"><option value="ios">iOS</option><option value="android">Android / Quest</option></select>
       <button class="full" id="cloneGo">Clone &amp; onboard</button>
-      <small class="hint">The service clones it, detects the Unity version, and installs the build script.</small>
+      <small class="hint">The service clones it in the background, detects the Unity version, and installs the build script. Big repos can take a while — you can leave or reload the page; progress shows on the project card. If an earlier attempt left a clone of the same repo under this name, it's reused.</small>
     </div>
 
     <div id="browsePane" style="display:none">
@@ -457,8 +457,82 @@ async function loadProjects() {
   PROJS = projs;
   const wrap = $("projects"); wrap.innerHTML = "";
   if (!projs.length) { wrap.innerHTML = '<div class="card meta">No projects yet. Onboard one below.</div>'; return; }
-  for (const p of projs) wrap.appendChild(projectCard(p));
+  for (const p of projs) wrap.appendChild(p.onboard_state ? onboardingCard(p) : projectCard(p));
   renderDevices();   // refresh the "default for" lines
+  scheduleOnboardPoll();
+}
+
+// ---- onboarding in progress ---------------------------------------------- //
+// Clones run on the server in the background and the project is registered
+// before the download starts, so this card is all the page needs: reloading
+// just shows it again with the current progress.
+function onboardingCard(p) {
+  const el = document.createElement("div"); el.className = "card";
+  const failed = p.onboard_state === "failed";
+  el.innerHTML = `
+    <div class="proj-head">
+      <div class="proj-name">${esc(p.name)}</div>
+      <div><span class="badge">${PLATFORM_LABEL[p.platform||"ios"] || esc(p.platform)}</span>
+        <span class="badge ${failed ? "warn" : ""}" data-onb-state>${failed ? "onboarding failed" : "cloning…"}</span></div>
+    </div>
+    <div class="meta">${esc(p.repo_url)} · ${esc(p.branch)}</div>
+    <div class="meta">${esc(p.local_path)}</div>
+    <div class="meta" data-onb-msg style="${failed ? "color:#fca5a5;white-space:pre-wrap" : ""}">${
+      failed ? esc(p.onboard_error || "failed") : esc(onbProgressText(p))}</div>
+    <small class="hint">${failed
+      ? "Retry picks up from what's already downloaded."
+      : "Safe to close or reload this page — the download continues on the server and resumes if it restarts."}</small>
+    <div class="btn-row">
+      ${failed ? `<button data-act="retry">Retry</button>` : ""}
+      <button class="sec" data-act="log">Clone log</button>
+      <button class="danger" data-act="cancel">${failed ? "Remove" : "Cancel"}</button>
+    </div>
+    <pre class="onbLog" style="display:none;max-height:240px;overflow:auto;font-size:11px;white-space:pre-wrap"></pre>`;
+  el.dataset.onb = p.id;
+  const retry = el.querySelector('[data-act="retry"]');
+  if (retry) retry.onclick = async () => {
+    try { await api("POST", `/api/projects/${p.id}/retry-onboard`); await loadProjects(); }
+    catch(e){ alert("Retry failed: " + e.message); }
+  };
+  el.querySelector('[data-act="log"]').onclick = async () => {
+    const pre = el.querySelector(".onbLog");
+    if (pre.style.display === "block") { pre.style.display = "none"; return; }
+    pre.style.display = "block"; pre.textContent = "loading…";
+    try { pre.textContent = await (await fetch(`/api/projects/${p.id}/onboard-log`)).text() || "(empty)"; pre.scrollTop = pre.scrollHeight; }
+    catch(e){ pre.textContent = e.message; }
+  };
+  el.querySelector('[data-act="cancel"]').onclick = async () => {
+    if (!confirm(`Stop onboarding ${p.name} and remove it from the service?`)) return;
+    const del = confirm("Also delete the downloaded files?\n\nOK = delete them\nCancel = keep them (onboarding again with the same name and URL reuses them)");
+    try { await api("DELETE", `/api/projects/${p.id}?delete_files=${del}`); await loadProjects(); }
+    catch(e){ alert("Remove failed: " + e.message); }
+  };
+  return el;
+}
+function onbProgressText(p) {
+  const since = p.onboard_started_at ? ` · started ${ago(p.onboard_started_at)}` : "";
+  return (p.onboard_progress || "starting…") + since;
+}
+let onbTimer = null;
+function scheduleOnboardPoll() {
+  clearTimeout(onbTimer);
+  if (!PROJS.some(p => p.onboard_state === "cloning")) return;
+  onbTimer = setTimeout(async () => {
+    let projs;
+    try { projs = await (await fetch("/api/projects")).json(); } catch(e) { scheduleOnboardPoll(); return; }
+    const changed = projs.length !== PROJS.length || projs.some(p => {
+      const old = PROJS.find(o => o.id === p.id);
+      return !old || old.onboard_state !== p.onboard_state;
+    });
+    if (changed) { await loadProjects(); return; }   // finished / failed: redraw cards
+    PROJS = projs;
+    for (const p of projs) {
+      if (p.onboard_state !== "cloning") continue;
+      const msg = document.querySelector(`[data-onb="${p.id}"] [data-onb-msg]`);
+      if (msg) msg.textContent = onbProgressText(p);
+    }
+    scheduleOnboardPoll();
+  }, 3000);
 }
 
 const isAndroid = p => (p.platform || "ios") === "android";
@@ -736,8 +810,15 @@ function switchTab(clone) {
 $("cloneGo").onclick = async () => {
   const body = { name:$("cloneName").value, repo_url:$("cloneUrl").value, branch:$("cloneBranch").value || "main", platform:$("clonePlatform").value };
   if (!body.name || !body.repo_url) { alert("Name and repo URL required"); return; }
-  $("cloneGo").disabled = true; $("cloneGo").textContent = "Cloning…";
-  try { await api("POST","/api/projects/clone", body); $("addPanel").style.display="none"; await loadProjects(); }
+  $("cloneGo").disabled = true; $("cloneGo").textContent = "Starting clone…";
+  // Returns within a few seconds: bad URLs / auth / branches fail here, a real
+  // download continues in the background and shows up as a "cloning…" card.
+  try {
+    await api("POST","/api/projects/clone", body);
+    $("addPanel").style.display="none";
+    $("cloneName").value = ""; $("cloneUrl").value = "";
+    await loadProjects();
+  }
   catch(e){ alert("Onboard failed: " + e.message); }
   finally { $("cloneGo").disabled=false; $("cloneGo").textContent="Clone & onboard"; }
 };

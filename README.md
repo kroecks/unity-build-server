@@ -14,6 +14,13 @@ Open the UI, tap **+ Onboard a project**, and pick one of two ways:
    (`http://terronas:3000/etc/game.git`). The service clones it under
    `builds_root`, reads `ProjectSettings/ProjectVersion.txt` to detect the Unity
    version, and writes `Assets/Editor/BuildScript.cs` into the project.
+   The project is registered in `projects.json` as soon as the download
+   starts and the clone runs in the background, so you can close or reload the
+   page; the card shows live progress. If the service restarts mid-clone, it
+   resumes on startup. A failed clone stays listed with its error and a
+   **Retry** button, which picks up from what's already downloaded. Onboarding
+   with the same name and URL as a clone already under `builds_root` reuses
+   that clone instead of failing with "destination not empty".
 2. **Browse the Mac**: a folder picker that walks the *mini's* filesystem
    (under `browse_root`) for a project you've already cloned. Folders that are
    Unity projects are marked ●. Select one, give it a name, onboard.

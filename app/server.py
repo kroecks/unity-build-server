@@ -11,7 +11,10 @@ from the phone or from a Gitea push webhook that routes to the right project.
 Endpoints
   GET  /                      phone + config UI
   GET  /api/projects          list projects
-  POST /api/projects/clone    onboard by cloning a repo URL
+  POST /api/projects/clone    onboard by cloning a repo URL (registers at once,
+                              downloads in the background; resumes on restart)
+  POST /api/projects/{id}/retry-onboard   resume a failed clone
+  GET  /api/projects/{id}/onboard-log     clone progress log
   POST /api/projects/adopt    onboard a project already on disk (path)
   PATCH /api/projects/{id}    edit Apple/behaviour fields
   DELETE /api/projects/{id}   remove (optionally delete the clone)
@@ -653,17 +656,54 @@ async def worker_loop() -> None:
             _wakeup.clear(); await _wakeup.wait(); continue
         build = QUEUE.popleft()
         project = reg.get(build.project_id)
-        if not project:
+        if not project or not project.ready:
             build.state = "failed"
-            build.log_path.write_text("project no longer exists\n")
+            build.log_path.write_text("project no longer exists\n" if not project
+                                      else "project is not onboarded yet (clone unfinished)\n")
             HISTORY.appendleft(build); save_history(); continue
         await run_build(build, project)
+
+
+# --------------------------------------------------------------------------- #
+# Clone onboarding (background, survives refreshes and restarts)
+# --------------------------------------------------------------------------- #
+
+# project id -> the asyncio task downloading/verifying it. The registry record
+# (onboard_state) is the source of truth; this only tracks what's running now.
+ONBOARD_TASKS: "dict[str, asyncio.Task]" = {}
+
+
+def _onboard_log(project_id: str) -> Path:
+    return LOG_DIR / f"onboard-{project_id}.log"
+
+
+def _start_onboarding(project_id: str) -> asyncio.Task:
+    t = ONBOARD_TASKS.get(project_id)
+    if t and not t.done():
+        return t
+    t = asyncio.create_task(onboarding.finish_clone_onboarding(
+        reg, project_id, _onboard_log(project_id)))
+    ONBOARD_TASKS[project_id] = t
+    t.add_done_callback(lambda _t, pid=project_id:
+                        ONBOARD_TASKS.pop(pid, None) if ONBOARD_TASKS.get(pid) is _t else None)
+    return t
+
+
+def _require_ready(proj: Project) -> None:
+    if not proj.ready:
+        what = "still being cloned" if proj.onboard_state == "cloning" else "not onboarded yet (failed — Retry it)"
+        raise HTTPException(status_code=409, detail=f"{proj.name} is {what}")
 
 
 @app.on_event("startup")
 async def _startup() -> None:
     load_history()
     asyncio.create_task(worker_loop())
+    # A clone that was mid-download when the server stopped picks up where it
+    # left off (the project dir and record are already there).
+    for p in reg.list():
+        if p.onboard_state == "cloning":
+            _start_onboarding(p.id)
 
 
 def enqueue(project: Project, source: str, deploy: bool, coalesce: bool = False,
@@ -720,7 +760,21 @@ async def index() -> str:
 
 @app.get("/api/projects")
 async def api_projects():
-    return [p.public() for p in reg.list()]
+    out = []
+    for p in reg.list():
+        d = p.public()
+        if not p.ready:
+            d["onboard_running"] = p.id in ONBOARD_TASKS
+            d["onboard_progress"] = onboarding.read_progress(_onboard_log(p.id))
+        out.append(d)
+    return out
+
+
+# How long POST /clone waits for git before answering. Bad URLs, auth failures
+# and unknown branches fail inside this window and come back as a plain 400;
+# anything still downloading after it is answered with the "cloning" record and
+# carries on in the background.
+CLONE_FAST_FAIL_S = 8
 
 
 @app.post("/api/projects/clone")
@@ -733,13 +787,70 @@ async def api_clone(request: Request, x_build_token: str = Header(default="")):
     if not name or not repo_url:
         raise HTTPException(status_code=400, detail="name and repo_url required")
     platform = _check_platform(body.get("platform") or "ios")
+    dest = onboarding.clone_dest(BUILDS_ROOT, name)
+    for other in reg.list():
+        if other.local_path and Path(other.local_path).resolve() == dest.resolve():
+            raise HTTPException(status_code=400, detail=(
+                f"{dest} is already used by project '{other.name}'. "
+                "Use a different name for a second project on the same repo."))
     try:
-        proj = onboarding.onboard_from_clone(reg, BUILDS_ROOT, name, repo_url, branch)
+        # True = a clone of this repo is already there (e.g. left by an earlier,
+        # interrupted onboarding): it gets reused and only topped up.
+        existed = onboarding.check_clone_dest(dest, repo_url)
     except onboarding.OnboardError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    if platform != proj.platform:
-        proj = reg.update(proj.id, platform=platform)
+    dest.mkdir(parents=True, exist_ok=True)
+    # Register BEFORE downloading: from here on the project survives a page
+    # refresh or a server restart, and the download resumes on startup.
+    proj = reg.add(Project(
+        id=Registry.new_id(), name=name, repo_url=repo_url, branch=branch,
+        local_path=str(dest), platform=platform,
+        onboard_state="cloning", onboard_started_at=time.time()))
+    task = _start_onboarding(proj.id)
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=CLONE_FAST_FAIL_S)
+    except asyncio.TimeoutError:
+        pass   # still downloading — that's the normal case for a real repo
+    cur = reg.get(proj.id)
+    if cur and cur.onboard_state == "failed" and not existed:
+        # Failed straight away (typo'd URL, no access, wrong branch): undo it so
+        # the user can just fix the form and resubmit.
+        reg.remove(proj.id)
+        _remove_clone_dir(dest)
+        raise HTTPException(status_code=400, detail=cur.onboard_error or "clone failed")
+    return (cur or proj).public()
+
+
+@app.post("/api/projects/{project_id}/retry-onboard")
+async def api_retry_onboard(project_id: str, x_build_token: str = Header(default="")):
+    """Restart a failed (or orphaned) clone; resumes from what's on disk."""
+    _check_token(x_build_token)
+    proj = reg.get(project_id)
+    if not proj:
+        raise HTTPException(status_code=404, detail="no such project")
+    if proj.ready:
+        return proj.public()
+    proj = reg.update(project_id, onboard_state="cloning", onboard_error="")
+    _start_onboarding(project_id)
     return proj.public()
+
+
+@app.get("/api/projects/{project_id}/onboard-log", response_class=PlainTextResponse)
+async def api_onboard_log(project_id: str):
+    lp = _onboard_log(project_id)
+    if not lp.exists():
+        return ""
+    # git progress overwrites itself with \r; keep only the final state of each line.
+    text = lp.read_text(errors="replace")[-200_000:]
+    return "\n".join(ln.rsplit("\r", 1)[-1] for ln in text.split("\n"))
+
+
+def _remove_clone_dir(p: Path) -> None:
+    """Delete a clone, but only ever one under builds_root."""
+    p = Path(p).resolve()
+    root = BUILDS_ROOT.resolve()
+    if p != root and root in p.parents and p.exists():
+        shutil.rmtree(p, ignore_errors=True)
 
 
 def _check_platform(p: str) -> str:
@@ -833,6 +944,7 @@ async def api_verify(project_id: str, x_build_token: str = Header(default="")):
     proj = reg.get(project_id)
     if not proj:
         raise HTTPException(status_code=404, detail="no such project")
+    _require_ready(proj)
     try:
         info = onboarding.verify_project(Path(proj.local_path))
     except onboarding.OnboardError as e:
@@ -849,12 +961,23 @@ async def api_delete(project_id: str, delete_files: bool = Query(default=False),
     proj = reg.get(project_id)
     if not proj:
         raise HTTPException(status_code=404, detail="no such project")
+    # Stop an in-flight clone first (kills git) so it can't recreate files or
+    # write the record back after we remove it.
+    task = ONBOARD_TASKS.pop(project_id, None)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
     if delete_files and proj.local_path:
         # Only delete clones we made under builds_root — never an adopted path elsewhere.
-        p = Path(proj.local_path).resolve()
-        if str(p).startswith(str(BUILDS_ROOT.resolve())) and p.exists():
-            shutil.rmtree(p, ignore_errors=True)
+        _remove_clone_dir(Path(proj.local_path))
     reg.remove(project_id)
+    try:
+        _onboard_log(project_id).unlink()
+    except OSError:
+        pass
     return {"removed": True}
 
 
@@ -1015,6 +1138,7 @@ async def trigger_build(project_id: str, request: Request, x_build_token: str = 
     proj = reg.get(project_id)
     if not proj:
         raise HTTPException(status_code=404, detail="no such project")
+    _require_ready(proj)
     do_deploy = True if deploy is None else deploy
     # Optional body {"devices": [...]} — "Build to…" in the UI. Omitted = defaults.
     body = await _json_body(request)
@@ -1088,6 +1212,9 @@ async def gitea_webhook(request: Request, x_gitea_signature: str = Header(defaul
 
 
 def _webhook_for_project(proj: Project, branch: str) -> dict:
+    if not proj.ready:
+        return {"project": proj.name, "skipped": True,
+                "reason": f"project is not onboarded yet ({proj.onboard_state})"}
     # Decide which branch pushes trigger a build:
     #  - If merge_from is set (e.g. ios merges main), the TRIGGER is the merge_from
     #    branch (main). We deliberately do NOT trigger on pushes to the build
@@ -1929,6 +2056,7 @@ async def install_artifact(project_id: str, build_id: str, request: Request,
     b = find_build(build_id)
     if not proj or not b or not b.artifact:
         raise HTTPException(status_code=404, detail="no such project/build/artifact")
+    _require_ready(proj)
     body = await _json_body(request)
     devs = validate_device_ids(proj, body.get("devices"))
     if not devs and not default_device_ids(proj):

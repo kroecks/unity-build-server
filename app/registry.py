@@ -98,6 +98,20 @@ class Project:
                                         # a duplicate (iOS buildNumber / Android bundleVersionCode)
     # Optional ordered pre-build steps (blob build, CCD upload, …) — see above.
     pre_build_steps: list = field(default_factory=list)
+    # Onboarding lifecycle. Clone-onboarding writes the record BEFORE the
+    # (possibly hours-long) download starts, so a page refresh or a server
+    # restart never loses it:
+    #   ""        -> ready (the default, so existing records are unchanged)
+    #   "cloning" -> git download / checkout / verify in progress; resumed
+    #                automatically when the server starts
+    #   "failed"  -> stopped with onboard_error; Retry resumes from what's on disk
+    onboard_state: str = ""
+    onboard_error: str = ""
+    onboard_started_at: float = 0.0
+
+    @property
+    def ready(self) -> bool:
+        return not self.onboard_state
 
     def __post_init__(self):
         # Normalize steps to dicts (they arrive as dicts from JSON or the API).
