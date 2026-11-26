@@ -57,6 +57,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .tabs button { flex:1; background:#2a2f3a; }
   .tabs button.active { background:#3b82f6; }
   small.hint { opacity:.6; font-size:12px; }
+  #timing { margin:8px 0; font-size:12px; }
+  #timing summary { cursor:pointer; opacity:.85; padding:4px 0; }
+  .trow { display:grid; grid-template-columns: 1fr 64px; gap:2px 8px; margin:5px 0 0; }
+  .trow .tname { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .trow .tdur { text-align:right; opacity:.8; font-variant-numeric:tabular-nums; }
+  .trow .tbar { grid-column:1 / span 2; height:5px; background:#2a2f3a; border-radius:4px; overflow:hidden; }
+  .trow .tbar > div { height:100%; background:#3b82f6; }
+  .trow.hot .tbar > div { background:#f59e0b; }
+  .thead { margin:10px 0 2px; opacity:.6; text-transform:uppercase; letter-spacing:.04em; font-size:11px; }
 </style>
 </head>
 <body>
@@ -124,6 +133,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <span class="hint">showing recent lines only</span>
       <button class="sec" id="fullLog">View full log</button>
     </div>
+    <details id="timing" style="display:none"><summary>⏱ Where the time went</summary><div id="timingBody"></div></details>
     <pre id="log"></pre>
     <div class="logbar">
       <span id="logfollow">following live output</span>
@@ -487,11 +497,13 @@ function stream(id) {
   currentBuildId = id; showStop(true);
   liveLines = []; pending = []; truncatedCount = 0;
   $("log").textContent = ""; $("fulllogwrap").style.display = "none";
+  $("timing").style.display = "none"; timingFor = id;
   es = new EventSource(`/logs/${id}`);
   setState("running");
   es.onmessage = e => { pending.push(e.data); scheduleFlush(); };
   es.addEventListener("done", e => {
     flushLog(); setState(e.data); es.close(); showStop(false); stopProgress(); refreshStatus();
+    loadTiming(id);
   });
   es.onerror = () => {};
 }
@@ -501,7 +513,7 @@ function streamDeviceLogs(p) {
   if (es) es.close();
   currentBuildId = null; showStop(false); stopProgress();
   liveLines = []; pending = []; truncatedCount = 0;
-  $("fulllogwrap").style.display = "none";
+  $("fulllogwrap").style.display = "none"; $("timing").style.display = "none"; timingFor = null;
   $("buildCard").style.display = "block";
   $("buildTitle").textContent = "Device logs: " + p.name;
   $("log").textContent = "Launching the app on the phone with console attached… (unlock the phone)\n";
@@ -520,7 +532,7 @@ function streamLastRunLogs(p) {
   if (es) es.close();
   currentBuildId = null; showStop(false); stopProgress();
   liveLines = []; pending = []; truncatedCount = 0;
-  $("fulllogwrap").style.display = "none";
+  $("fulllogwrap").style.display = "none"; $("timing").style.display = "none"; timingFor = null;
   $("buildCard").style.display = "block";
   $("buildTitle").textContent = "Last run logs: " + p.name;
   $("log").textContent = "Pulling the last run's logs from the phone (no relaunch)… "
@@ -619,6 +631,48 @@ $("fullLog").onclick = loadFullLog;
 $("closeBuild").onclick = () => { if (es) es.close(); $("buildCard").style.display="none"; };
 
 // Load a finished build's saved log (tapped from history), no live stream.
+// ---- timing breakdown ------------------------------------------------------ //
+// Phases come from the build script's ">>>" headers, timestamped live by the
+// server; the Unity section is parsed from Unity's own asset-pipeline summary.
+let timingFor = null;
+async function loadTiming(id) {
+  timingFor = id;
+  let t;
+  try { const r = await fetch(`/api/builds/${id}/timing`); if (!r.ok) throw 0; t = await r.json(); }
+  catch(e){ if (timingFor === id) $("timing").style.display = "none"; return; }
+  if (timingFor !== id) return;   // user moved on to another build
+  renderTiming(t);
+}
+function timingRows(rows, total, nameKey, secKey) {
+  const max = Math.max(1, ...rows.map(r => r[secKey]));
+  return rows.map(r => {
+    const sec = r[secKey], pct = total ? sec/total*100 : 0;
+    return `<div class="trow${pct >= 25 ? " hot" : ""}" title="${esc(r[nameKey])}">
+      <span class="tname">${esc(r[nameKey])}</span>
+      <span class="tdur">${fmtDur(sec)}${total ? ` · ${Math.round(pct)}%` : ""}</span>
+      <div class="tbar"><div style="width:${(sec/max*100).toFixed(1)}%"></div></div></div>`;
+  }).join("");
+}
+function renderTiming(t) {
+  const box = $("timing"), body = $("timingBody");
+  const total = t.total || 0;
+  // Fold sub-second phases (one-line status messages) so the list stays readable.
+  const phases = (t.phases||[]).filter(p => p.duration >= 1);
+  const unity = t.unity || [];
+  if (!phases.length && !unity.length) { box.style.display = "none"; return; }
+  let html = "";
+  if (phases.length) {
+    html += `<div class="thead">Build steps (in order)</div>` + timingRows(phases, total, "name", "duration");
+  } else {
+    html += `<div class="meta">No step timings for this build (recorded for builds started after this update).</div>`;
+  }
+  if (unity.length) {
+    html += `<div class="thead">Inside Unity: asset pipeline</div>` + timingRows(unity, total, "name", "seconds");
+  }
+  body.innerHTML = html;
+  box.style.display = "block";
+}
+
 async function viewLog(b) {
   if (es) es.close();
   currentBuildId = null; showStop(false); stopProgress();
@@ -627,6 +681,7 @@ async function viewLog(b) {
   $("buildCard").style.display="block";
   $("buildTitle").textContent = b.project_name + " · " + b.created_iso;
   setState(b.state);
+  loadTiming(b.id);
   $("buildCard").scrollIntoView({behavior:"smooth"});
   try {
     const r = await fetch(`/logs/${b.id}/raw`);
@@ -666,6 +721,7 @@ async function refreshStatus() {
   if (st.current && st.current.state === "running" && currentBuildId === st.current.id) {
     startProgress(st.current.started_at ? null : null,  // started_at is epoch below
                   st.current.elapsed, st.current.avg_duration, st.current.started_iso);
+    loadTiming(st.current.id);   // live breakdown, refreshed each poll
   } else if (!st.current || st.current.state !== "running") {
     stopProgress();
   }

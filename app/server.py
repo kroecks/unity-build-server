@@ -32,6 +32,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -169,6 +170,9 @@ class Build:
     commit_sha: str = ""        # the git commit this build came from (short)
     label: str = ""             # user-assigned name/tag for this build
     platform: str = "ios"       # project platform at enqueue time (UI hides iOS-only actions)
+    # Timing breakdown: one entry per ">>> " phase header build.sh prints, with
+    # its start offset (seconds since started_at). Durations are derived.
+    phases: list = field(default_factory=list)
 
     def duration(self) -> Optional[float]:
         if self.started_at is None:
@@ -199,7 +203,22 @@ class Build:
         else:
             d["version_label"] = ""
         d["commit_short"] = (self.commit_sha or "")[:8]
+        d.pop("phases", None)
+        d["timing"] = self.timing()
         return d
+
+    def timing(self) -> list:
+        """Phases with durations: each runs until the next starts (the last one
+        until the build finished, or now if it's still running)."""
+        if self.started_at is None or not self.phases:
+            return []
+        end = (self.finished_at if self.finished_at is not None else time.time()) - self.started_at
+        out = []
+        for i, ph in enumerate(self.phases):
+            nxt = self.phases[i + 1]["start"] if i + 1 < len(self.phases) else end
+            out.append({"name": ph["name"], "start": round(ph["start"], 1),
+                        "duration": round(max(0.0, nxt - ph["start"]), 1)})
+        return out
 
 
 QUEUE: "deque[Build]" = deque()
@@ -220,7 +239,8 @@ def save_history() -> None:
                  "finished_at": b.finished_at, "returncode": b.returncode,
                  "output_dir": b.output_dir, "artifact": b.artifact,
                  "version": b.version, "build_number": b.build_number,
-                 "commit_sha": b.commit_sha, "label": b.label, "platform": b.platform}
+                 "commit_sha": b.commit_sha, "label": b.label, "platform": b.platform,
+                 "phases": b.phases}
                 for b in list(HISTORY)]
         tmp = HISTORY_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2))
@@ -241,7 +261,7 @@ def load_history() -> None:
                 ("id", "project_id", "project_name", "source", "deploy",
                  "state", "created_at", "started_at", "finished_at",
                  "returncode", "output_dir", "artifact",
-                 "version", "build_number", "commit_sha", "label", "platform")
+                 "version", "build_number", "commit_sha", "label", "platform", "phases")
                 if k in rec}))
     except Exception:
         pass
@@ -254,6 +274,40 @@ def find_build(build_id: str) -> Optional[Build]:
         if b.id == build_id:
             return b
     return None
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _phase_header(line: str) -> str:
+    """build.sh's log() prints '>>> <title>' in bold; return the title or ''."""
+    ln = _ANSI_RE.sub("", line).strip()
+    return ln[4:].strip()[:160] if ln.startswith(">>> ") else ""
+
+
+# Unity prints an "Asset Pipeline Refresh" summary with top-level categories on
+# single-tab lines ("\tImportOutOfDateAssets: 2260517.905ms"); children have
+# two or more tabs and are already included in their parent's figure.
+_UNITY_CAT_RE = re.compile(r"^\t([A-Za-z][A-Za-z0-9]+): ([0-9.]+)ms")
+
+
+def unity_breakdown(log_path: Path) -> list:
+    """Sum Unity's top-level asset-pipeline timings across the whole build log.
+    Works on old logs too (no live timestamps needed). Stops at build.sh's
+    failure dump, which re-prints the tail of the Unity log and would double count."""
+    totals: dict = {}
+    try:
+        with open(log_path, errors="replace") as f:
+            for line in f:
+                if "Last lines of the Unity log" in line:
+                    break
+                m = _UNITY_CAT_RE.match(line)
+                if m:
+                    totals[m.group(1)] = totals.get(m.group(1), 0.0) + float(m.group(2)) / 1000.0
+    except OSError:
+        return []
+    rows = [{"name": k, "seconds": round(v, 1)} for k, v in totals.items() if v >= 0.5]
+    return sorted(rows, key=lambda r: -r["seconds"])
 
 
 async def run_build(build: Build, project: Project) -> None:
@@ -351,11 +405,25 @@ async def run_build(build: Build, project: Project) -> None:
                 limit=1024 * 1024,        # 1 MB stream buffer (was 64 KB default)
             )
             CURRENT_PROC = proc
+            pending = ""   # partial last line carried between chunks
             while True:
                 chunk = await proc.stdout.read(65536)
                 if not chunk:
                     break
-                logf.write(chunk.decode(errors="replace")); logf.flush()
+                text = chunk.decode(errors="replace")
+                logf.write(text); logf.flush()
+                # Timestamp each phase header as it arrives (the log itself has
+                # no timestamps, so this is the only place we can learn them).
+                pending += text
+                lines = pending.split("\n")
+                pending = lines.pop()
+                if len(pending) > 65536:
+                    pending = ""   # giant unterminated line (IL2CPP); not a header
+                for ln in lines:
+                    name = _phase_header(ln)
+                    if name:
+                        build.phases.append({"name": name,
+                                             "start": time.time() - build.started_at})
             rc = await proc.wait()
             build.returncode = rc
             if build.state == "cancelled":
@@ -909,6 +977,17 @@ async def logs_raw(build_id: str):
     if not b or not b.log_path.exists():
         raise HTTPException(status_code=404, detail="no such build/log")
     return b.log_path.read_text(errors="replace")
+
+
+@app.get("/api/builds/{build_id}/timing")
+async def build_timing(build_id: str):
+    """Where the time went: build.sh phases (recorded live; builds from before
+    this feature have none) plus Unity's own asset-pipeline categories."""
+    b = find_build(build_id)
+    if not b:
+        raise HTTPException(status_code=404, detail="no such build")
+    return {"total": b.duration(), "phases": b.timing(),
+            "unity": await asyncio.to_thread(unity_breakdown, b.log_path)}
 
 
 @app.get("/logs/{build_id}")
