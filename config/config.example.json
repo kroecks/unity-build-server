@@ -1,18 +1,39 @@
 {
+  "_comment": "Copy to config/config.json and fill in. Keys starting with _ are ignored by the server. Restart the service after any change: config is only read at startup. chmod 600 the real file; it holds secrets.",
+
+  "_comment_paths": "REQUIRED. ~ is expanded.",
   "build_script": "~/unity-build-server/scripts/build.sh",
   "log_dir": "~/unity-build-server/logs",
-  "registry_path": "~/unity-build-server/config/projects.json",
   "builds_root": "~/builds",
-  "browse_root": "~",
+  "registry_path": "~/unity-build-server/config/projects.json",
 
-  "output_root": "/Volumes/GameDev/ubs-output",
+  "_comment_optional_paths": "browse_root: sandbox for the 'Browse the Mac' picker (default: home dir). output_root: per-build output dirs (default: <builds_root>/output); point at the USB drive if you like.",
+  "browse_root": "~",
+  "output_root": "/Volumes/BuildUSB/output",
+
+  "_comment_retention": "Keep at most this many build output dirs per project; 0 = keep all. Default 10.",
   "keep_builds_per_project": 10,
 
-  "build_token": "CHANGE-ME-a-passphrase-or: openssl rand -hex 24",
-  "gitea_webhook_secret": "CHANGE-ME-matches-every-gitea-webhook-secret",
+  "_comment_security": "build_token: required by the UI/API for builds and edits. gitea_webhook_secret: must match the Secret on the Gitea webhook; empty = signatures not checked.",
+  "build_token": "change-me-long-random-string",
+  "gitea_webhook_secret": "change-me-too",
 
-  "asc_key_id": "",
-  "asc_issuer_id": "",
-  "asc_key_path": "~/private_keys/AuthKey_XXXXXXXXXX.p8",
-  "_asc_note": "App Store Connect TEAM key (not Individual) for TestFlight upload. Find key_id + issuer_id in ASC -> Users and Access -> Integrations -> Team Keys."
+  "_comment_ios_testflight": "Optional; needed only for Distribute / auto-distribute. Must be a TEAM key (App Store Connect -> Users and Access -> Integrations -> Team Keys), not an Individual key.",
+  "asc_key_id": "ABC123DEFG",
+  "asc_issuer_id": "00000000-0000-0000-0000-000000000000",
+  "asc_key_path": "~/keys/AuthKey_ABC123DEFG.p8",
+
+  "_comment_android_keystores": "Optional; needed only for release-signed Android builds. KEYED BY KEYSTORE PATH, exactly as typed in the project's 'Keystore path' field. store_pass = password of the keystore file. key_pass = password of the key (the project's 'Key alias') inside it; omit it if it equals store_pass, which is always the case for PKCS12 keystores. 'default' applies to any keystore with no entry of its own.",
+  "android_keystores": {
+    "~/keys/voxelmage.keystore": {
+      "store_pass": "keystore-password",
+      "key_pass": "key-password"
+    },
+    "default": {
+      "store_pass": "shared-password"
+    }
+  },
+
+  "_comment_adb": "Optional. Default: adb on PATH (brew install android-platform-tools), else the adb bundled with a Hub editor's Android module.",
+  "adb_path": "/opt/homebrew/bin/adb"
 }
