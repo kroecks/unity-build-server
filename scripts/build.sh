@@ -29,6 +29,129 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 log() { printf '\n\033[1m>>> %s\033[0m\n' "$*"; }
 mkdir -p "$OUTPUT_DIR"
 
+# Install a .app to the device, classifying failures so we retry only the
+# transient ones. Returns 0 on success, 1 on give-up. Needs UBS_DEVICE_UDID.
+install_app_to_device() {
+  local app="$1" attempt out
+  log "Installing $app"
+  for attempt in 1 2 3; do
+    # Capture output so we can read the REAL reason (devicectl buries it inside
+    # a generic 3002). tee keeps it visible in the live log too.
+    out="$(xcrun devicectl device install app --device "$UBS_DEVICE_UDID" "$app" 2>&1)"
+    local rc=$?
+    printf '%s\n' "$out"
+    if [[ $rc -eq 0 ]]; then
+      return 0
+    fi
+    # Disk-full never succeeds on retry — stop immediately with the real numbers.
+    if printf '%s' "$out" | grep -qiE "Insufficient storage|not enough space"; then
+      log "INSTALL FAILED: the PHONE is out of storage."
+      printf '%s\n' "$out" | grep -iE "bytes needed|available|DiskSpaceRequired" | sed 's/^/    /' >&2
+      echo "  Free up space on the iPhone (the app needs well over 700 MB to stage)," >&2
+      echo "  then tap Install on this build in the UI. No rebuild needed." >&2
+      return 1
+    fi
+    # Packaging errors never succeed on retry either — stop and name the real cause.
+    if printf '%s' "$out" | grep -qiE "DuplicateIdentifier|same identifier"; then
+      log "INSTALL FAILED: bundle identifier collision (a framework shares the app's id)."
+      printf '%s\n' "$out" | grep -iE "same identifier|DuplicateIdentifier" | sed 's/^/    /' >&2
+      echo "  This is a build-packaging bug, not a device issue. Rebuild is required." >&2
+      return 1
+    fi
+    if printf '%s' "$out" | grep -qiE "This application's application-identifier entitlement|does not match|provisioning profile"; then
+      log "INSTALL FAILED: signing/provisioning mismatch — rebuild required."
+      printf '%s\n' "$out" | grep -iE "entitlement|provisioning|identifier" | head -4 | sed 's/^/    /' >&2
+      return 1
+    fi
+    # Otherwise treat as transient (sleep/lock/network) and retry.
+    log "Install attempt $attempt failed (transient). Make sure the phone is unlocked & awake. Retrying in 5s…"
+    sleep 5
+  done
+  log "INSTALL FAILED after 3 tries — phone locked, asleep, or off-network during transfer."
+  echo "  Unlock the phone (keep it awake) and tap Install on this build in the UI." >&2
+  return 1
+}
+
+# --- Install-only short-circuit -------------------------------------------- #
+# The UI "Install" button re-pushes an already-built artifact to the phone
+# without rebuilding. We skip straight to the install, with the same retries.
+if [[ "${UBS_INSTALL_ONLY:-0}" == "1" ]]; then
+  ART="${UBS_INSTALL_ARTIFACT:-}"
+  log "Install-only: pushing existing artifact to device"
+  [[ -n "$UBS_DEVICE_UDID" ]] || { log "ERROR: no device UDID set."; exit 1; }
+  [[ -n "$ART" && -e "$ART" ]] || { log "ERROR: artifact not found: $ART"; exit 1; }
+  # If the artifact is an .xcarchive or .ipa we need the .app inside; devicectl
+  # installs a .app bundle. Find one if we were handed a container.
+  if [[ "$ART" == *.app ]]; then
+    APP_PATH="$ART"
+  else
+    APP_PATH="$(/usr/bin/find "$(dirname "$ART")" -name '*.app' -type d -maxdepth 5 2>/dev/null | head -n1)"
+  fi
+  [[ -n "$APP_PATH" && -d "$APP_PATH" ]] || { log "ERROR: no .app found to install from $ART"; exit 1; }
+  if install_app_to_device "$APP_PATH"; then
+    log "Installed. Launching…"
+    xcrun devicectl device process launch --device "$UBS_DEVICE_UDID" "$UBS_BUNDLE_ID" || true
+    log "DONE"; exit 0
+  fi
+  exit 1
+fi
+
+# --- Distribute-only short-circuit ----------------------------------------- #
+# The UI "Distribute" button re-exports an existing .xcarchive for App Store
+# distribution and uploads it to TestFlight via the ASC API key. No rebuild.
+if [[ "${UBS_DISTRIBUTE:-0}" == "1" ]]; then
+  ARCH="${UBS_DISTRIBUTE_ARCHIVE:-}"
+  log "Distribute: exporting archive for App Store and uploading to TestFlight"
+  [[ -n "$ARCH" && -d "$ARCH" ]] || { log "ERROR: no .xcarchive at: $ARCH"; exit 1; }
+  for v in UBS_ASC_KEY_ID UBS_ASC_ISSUER_ID UBS_ASC_KEY_PATH UBS_DEVELOPMENT_TEAM; do
+    [[ -n "${!v:-}" ]] || { log "ERROR: $v is not set (App Store Connect key / team)."; exit 1; }
+  done
+  [[ -f "$UBS_ASC_KEY_PATH" ]] || { log "ERROR: ASC key file not found: $UBS_ASC_KEY_PATH"; exit 1; }
+
+  EXPORT_DIR="${UBS_OUTPUT_DIR:-$(dirname "$ARCH")}/export"
+  rm -rf "$EXPORT_DIR"; mkdir -p "$EXPORT_DIR"
+  PLIST="$EXPORT_DIR/ExportOptions.plist"
+  cat > "$PLIST" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>method</key><string>app-store-connect</string>
+  <key>teamID</key><string>$UBS_DEVELOPMENT_TEAM</string>
+  <key>signingStyle</key><string>automatic</string>
+  <key>destination</key><string>export</string>
+  <key>uploadSymbols</key><true/>
+</dict></plist>
+PL
+
+  log "xcodebuild -exportArchive (App Store distribution signing)"
+  if ! xcodebuild -exportArchive \
+      -archivePath "$ARCH" \
+      -exportOptionsPlist "$PLIST" \
+      -exportPath "$EXPORT_DIR" \
+      -allowProvisioningUpdates \
+      -authenticationKeyID "$UBS_ASC_KEY_ID" \
+      -authenticationKeyIssuerID "$UBS_ASC_ISSUER_ID" \
+      -authenticationKeyPath "$UBS_ASC_KEY_PATH"; then
+    log "ERROR: exportArchive failed. If it says 'No Accounts with App Store Connect"
+    echo "  Access' or auth -26000, your API key must be a TEAM key, not Individual." >&2
+    exit 1
+  fi
+
+  IPA="$(/usr/bin/find "$EXPORT_DIR" -name '*.ipa' -maxdepth 2 | head -n1)"
+  [[ -n "$IPA" && -f "$IPA" ]] || { log "ERROR: no .ipa produced by exportArchive."; exit 1; }
+  # altool looks for AuthKey_<id>.p8 in a private_keys dir; point it at ours.
+  export API_PRIVATE_KEYS_DIR="$(dirname "$UBS_ASC_KEY_PATH")"
+  log "Uploading $IPA to App Store Connect / TestFlight"
+  if ! xcrun altool --upload-app -t ios -f "$IPA" \
+      --apiKey "$UBS_ASC_KEY_ID" --apiIssuer "$UBS_ASC_ISSUER_ID"; then
+    log "ERROR: upload failed. Check the API key is a TEAM key with App Manager role,"
+    echo "  and that the build version/bundle id are valid for this app in ASC." >&2
+    exit 1
+  fi
+  log "DONE — uploaded to TestFlight. Processing on Apple's side takes a few minutes."
+  exit 0
+fi
+
 # --- 1. Sync repo to exactly origin/<branch> ------------------------------- #
 # The branch is chosen per project in the UI, so a hard reset to origin/<branch>
 # is the intended "match the remote exactly" — it will NOT silently clobber your
@@ -54,6 +177,46 @@ else
   git clean -fd    # keep ignored files (Library/ survives) — fast
 fi
 git log -1 --oneline
+
+# --- 1a. Optional merge of another branch into this one -------------------- #
+# e.g. the 'ios' branch merges in 'main' so a push to main gets built on ios.
+# CLEAN/fast-forward ONLY: a conflict aborts the merge AND the build, leaving
+# origin untouched, so you resolve it by hand. A successful merge is pushed back
+# to origin/<branch> so it persists (the build dir is reset each run).
+if [[ -n "${UBS_MERGE_FROM:-}" && "$UBS_MERGE_FROM" != "$BRANCH" ]]; then
+  MF="$UBS_MERGE_FROM"
+  log "Merging origin/$MF into $BRANCH (clean-only; conflict will abort)"
+  if ! git rev-parse --verify --quiet "origin/$MF" >/dev/null; then
+    log "ERROR: merge source 'origin/$MF' does not exist."; exit 1
+  fi
+  # If already up to date (nothing to merge), this is a no-op and succeeds.
+  if git merge --no-edit --no-ff "origin/$MF"; then
+    # Did the merge actually add commits? If so, push it back so it persists.
+    if [[ -n "$(git rev-list "origin/$BRANCH..HEAD" 2>/dev/null)" ]]; then
+      log "Merge clean — pushing updated $BRANCH back to origin"
+      if ! git push origin "$BRANCH"; then
+        log "WARNING: merge succeeded locally but push to origin/$BRANCH failed."
+        echo "  Building the merged tree anyway, but origin was NOT updated." >&2
+      fi
+    else
+      log "$BRANCH already contains origin/$MF — nothing to merge."
+    fi
+  else
+    # Conflict (or other merge failure): abort cleanly and stop. Do NOT build a
+    # half-merged tree, and do NOT touch origin.
+    git merge --abort 2>/dev/null || true
+    log "MERGE CONFLICT: origin/$MF does not merge cleanly into $BRANCH."
+    echo "  The build is aborted and origin/$BRANCH is untouched." >&2
+    echo "  Resolve by hand:  git checkout $BRANCH && git merge origin/$MF" >&2
+    echo "  …fix conflicts, commit, push, then rebuild." >&2
+    git status --short | sed 's/^/    /' >&2 || true
+    exit 2
+  fi
+  git log -1 --oneline
+fi
+
+# Capture the commit actually being built (AFTER any merge), for build-info.json.
+BUILD_COMMIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo "")"
 
 # --- 1b. Install the build entry point AFTER the clean --------------------- #
 # The clean above wipes untracked files, so BuildScript.cs must be (re)written
@@ -233,6 +396,20 @@ if [[ $UNITY_RC -ne 0 ]]; then
   exit $UNITY_RC
 fi
 
+# Record version/build-number/commit for the server to read back and display.
+# bundleVersion lives in ProjectSettings.asset (YAML: "  bundleVersion: 1.4.2").
+BUILD_VERSION="$(grep -m1 '  bundleVersion:' "$PROJECT_DIR/ProjectSettings/ProjectSettings.asset" 2>/dev/null \
+  | sed 's/.*bundleVersion:[[:space:]]*//' | tr -d '\r' || echo "")"
+python3 -I - "$OUTPUT_DIR/build-info.json" <<PYEOF || true
+import json, sys
+json.dump({
+    "version": "${BUILD_VERSION}".strip(),
+    "build_number": "${UBS_BUILD_NUMBER:-}".strip(),
+    "commit_sha": "${BUILD_COMMIT_SHA:-}".strip(),
+}, open(sys.argv[1], "w"), indent=2)
+PYEOF
+log "Recorded build-info.json: version=${BUILD_VERSION} build=${UBS_BUILD_NUMBER:-} commit=${BUILD_COMMIT_SHA:-}"
+
 # --- 4. Xcode compile/sign + optional device install ----------------------- #
 log "Building Xcode project"
 cd "$XCODE_BUILD_DIR"
@@ -242,9 +419,53 @@ else
   SCHEME_FLAG=(-project "Unity-iPhone.xcodeproj")
 fi
 
+# Device detection — made explicit and loud so a missed device is visible in the
+# log instead of silently falling through to "archive only".
 DEVICE_AVAILABLE=0
-if [[ -n "${UBS_DEVICE_UDID:-}" ]] && xcrun devicectl list devices 2>/dev/null | grep -q "$UBS_DEVICE_UDID"; then
-  DEVICE_AVAILABLE=1
+if [[ "$DEPLOY" == "1" ]]; then
+  if [[ -z "${UBS_DEVICE_UDID:-}" ]]; then
+    log "Deploy requested but NO device UDID is set for this project."
+    echo "  Set the Device UDID in the project's settings to install to your phone." >&2
+    echo "  Connected devices right now:" >&2
+    xcrun devicectl list devices 2>&1 | sed 's/^/    /' >&2 || true
+  else
+    log "Deploy requested — looking for device $UBS_DEVICE_UDID"
+    # Use devicectl's JSON output and match the UDID exactly against a CONNECTED
+    # physical device. The pretty-printed table appends " (UDID)" and lists
+    # shutdown simulators, so JSON is far more reliable to parse.
+    DEV_JSON="$(xcrun devicectl list devices --json-output - 2>/dev/null || true)"
+    # Show the human-readable list in the log for visibility.
+    xcrun devicectl list devices 2>/dev/null | sed 's/^/    /' || true
+    MATCH="$(printf '%s' "$DEV_JSON" | python3 -I -c '
+import sys, json
+want = sys.argv[1]
+try: data = json.load(sys.stdin)
+except Exception: sys.exit(1)
+devs = (data.get("result") or {}).get("devices") or []
+for d in devs:
+    udid = (d.get("hardwareProperties") or {}).get("udid") or d.get("identifier") or ""
+    state = (d.get("connectionProperties") or {}).get("tunnelState") \
+            or (d.get("deviceProperties") or {}).get("connectionState") or ""
+    if udid == want:
+        print("found"); sys.exit(0)
+sys.exit(1)
+' "$UBS_DEVICE_UDID" 2>/dev/null || true)"
+    if [[ "$MATCH" == "found" ]]; then
+      DEVICE_AVAILABLE=1
+      log "Device $UBS_DEVICE_UDID found — will install after build."
+    else
+      # Fall back to a plain substring match in case the JSON shape differs on
+      # this Xcode version — better to try the install than wrongly archive.
+      if xcrun devicectl list devices 2>/dev/null | grep -q "$UBS_DEVICE_UDID"; then
+        DEVICE_AVAILABLE=1
+        log "Device $UBS_DEVICE_UDID found (table match) — will install after build."
+      else
+        log "Device $UBS_DEVICE_UDID NOT found above."
+        echo "  Check: phone plugged in, unlocked, trusted, Developer Mode on." >&2
+        echo "  The UDID must match exactly (incl. the dash)." >&2
+      fi
+    fi
+  fi
 fi
 
 # Automatic signing — this is the command-line equivalent of opening Xcode,
@@ -258,8 +479,12 @@ SIGN_SETTINGS=(
   CODE_SIGN_STYLE=Automatic
   DEVELOPMENT_TEAM="$UBS_DEVELOPMENT_TEAM"
 )
-# If a bundle id is configured, pin it so the managed profile matches the app id.
-[[ -n "${UBS_BUNDLE_ID:-}" ]] && SIGN_SETTINGS+=( PRODUCT_BUNDLE_IDENTIFIER="$UBS_BUNDLE_ID" )
+# NOTE: we deliberately do NOT pass PRODUCT_BUNDLE_IDENTIFIER here. A build
+# setting on the xcodebuild command line applies to EVERY target, which stamps
+# the app's bundle id onto UnityFramework.framework too — iOS then rejects the
+# install with "DuplicateIdentifier: parent bundle has the same identifier as
+# sub-bundle". Unity already sets the correct per-target bundle ids in the
+# project, so we leave them alone and only drive signing.
 
 if [[ -z "${UBS_DEVELOPMENT_TEAM:-}" ]]; then
   log "ERROR: no Apple Team ID set for this project — signing will fail."
@@ -267,19 +492,42 @@ if [[ -z "${UBS_DEVELOPMENT_TEAM:-}" ]]; then
   exit 1
 fi
 
+# Keep ALL Xcode intermediates on the (roomy) output volume, not the mini's
+# small internal drive. For an IL2CPP Unity build, DerivedData is several GB per
+# build; without this it defaults to ~/Library/Developer/Xcode/DerivedData on
+# the internal disk and fills it. Both build and archive use this path, and it
+# lives under the per-build output dir so retention cleans it up too.
+DERIVED_DATA="$XCODE_BUILD_DIR/DerivedData"
+mkdir -p "$DERIVED_DATA"
+
 if [[ "$DEPLOY" == "1" && "$DEVICE_AVAILABLE" == "1" ]]; then
   log "Device available — building for device and installing (automatic signing)"
   xcodebuild "${SCHEME_FLAG[@]}" -scheme Unity-iPhone -configuration Release \
     -destination "id=$UBS_DEVICE_UDID" "${SIGN_SETTINGS[@]}" \
-    -derivedDataPath ./DerivedData build
-  APP_PATH="$(/usr/bin/find ./DerivedData -name '*.app' -maxdepth 4 -type d | head -n1)"
-  log "Installing $APP_PATH"
-  xcrun devicectl device install app --device "$UBS_DEVICE_UDID" "$APP_PATH"
-  xcrun devicectl device process launch --device "$UBS_DEVICE_UDID" "$UBS_BUNDLE_ID" || true
+    -derivedDataPath "$DERIVED_DATA" build
+  APP_PATH="$(/usr/bin/find "$DERIVED_DATA" -name '*.app' -maxdepth 5 -type d | head -n1)"
+  # Also archive, so a successful device build is still promotable to TestFlight
+  # and downloadable even if the phone install step can't land right now.
+  log "Archiving the signed build for distribution/download"
+  xcodebuild "${SCHEME_FLAG[@]}" -scheme Unity-iPhone -configuration Release -sdk iphoneos \
+    "${SIGN_SETTINGS[@]}" -derivedDataPath "$DERIVED_DATA" \
+    -archivePath "$XCODE_BUILD_DIR/build.xcarchive" archive \
+    >/dev/null 2>&1 || log "  (archive step skipped/failed — device build still OK)"
+
+  if install_app_to_device "$APP_PATH"; then
+    log "Installed to device. Launching…"
+    xcrun devicectl device process launch --device "$UBS_DEVICE_UDID" "$UBS_BUNDLE_ID" || true
+    log "DONE"
+  else
+    # Build succeeded; only the install didn't land. Don't fail the whole build —
+    # the artifact is good, and the UI's Install button can push it later.
+    log "DONE (build succeeded, install pending — see reason above)"
+  fi
+  exit 0
 else
   [[ "$DEPLOY" == "1" ]] && log "Deploy requested but device not reachable — archiving" || log "Archiving only"
   xcodebuild "${SCHEME_FLAG[@]}" -scheme Unity-iPhone -configuration Release -sdk iphoneos \
-    "${SIGN_SETTINGS[@]}" \
+    "${SIGN_SETTINGS[@]}" -derivedDataPath "$DERIVED_DATA" \
     -archivePath "$XCODE_BUILD_DIR/build.xcarchive" archive
   log "Archive at $XCODE_BUILD_DIR/build.xcarchive"
 fi

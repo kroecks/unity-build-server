@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Optional
 
 
+class RegistryWriteError(Exception):
+    """Raised when the registry can't be persisted (e.g. disk full)."""
+
+
 @dataclass
 class PreBuildStep:
     """One optional, project-defined step run before the Unity player build.
@@ -50,6 +54,23 @@ class Project:
     reclaim_disk: bool = True           # uninstall other editor versions when installing
     clean_ignored: bool = False         # git clean -fdx (nukes Library/) if true
     build_script_installed: bool = False  # has BuildScript.cs been dropped in?
+    # Per-project CCD / content settings. The service account auth is shared
+    # (host env: UGS_CLI_SERVICE_KEY_ID/SECRET); these differ per project and are
+    # exposed to pre-build steps as $UBS_CCD_* so one shared step scales to all.
+    ccd_project_id: str = ""            # Unity project id (per game)
+    ccd_environment: str = ""           # environment name, e.g. "production"
+    ccd_bucket: str = ""                # CCD bucket name
+    addressables_profile: str = ""      # Addressables profile to build (e.g. "Development")
+    remote_build_path: str = ""         # where Addressables writes bundles (e.g. "ServerData/iOS")
+    scripting_defines: str = ""         # extra scripting define symbols for the build,
+                                        # e.g. "TK_IOS_DEV" — needed so the CCD auth
+                                        # header code is compiled in (else content = 401)
+    merge_from: str = ""                # before building <branch>, merge this branch
+                                        # into it (e.g. "main" when branch is "ios").
+                                        # CLEAN/fast-forward only; a conflict ABORTS the
+                                        # build and leaves the branch untouched. Empty = off.
+    auto_distribute: bool = False       # upload successful webhook builds to TestFlight
+                                        # automatically (uses shared ASC key in config)
     # Optional ordered pre-build steps (blob build, CCD upload, …) — see above.
     pre_build_steps: list = field(default_factory=list)
 
@@ -93,9 +114,28 @@ class Registry:
 
     def _write(self, data: dict) -> None:
         tmp = self.path.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, self.path)
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            # Clean up the partial temp file so it doesn't linger, and raise a
+            # clear error the API layer turns into a readable message instead of
+            # a raw 500 traceback. The real projects.json is untouched (we only
+            # os.replace after a fully-written temp), so nothing is corrupted.
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            import errno
+            if e.errno == errno.ENOSPC:
+                raise RegistryWriteError(
+                    "No space left on the build machine's disk — the change "
+                    "could not be saved. Free up space (old build outputs under "
+                    "output_root are the usual cause) and try again."
+                ) from e
+            raise RegistryWriteError(f"Could not save registry: {e}") from e
 
     def list(self) -> list[Project]:
         return [Project.from_record(r) for r in self._read().values()]

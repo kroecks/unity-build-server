@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for the Unity build server. Installed into
+  ~/Library/LaunchAgents by dev/install-service.sh (which fills the __PLACEHOLDERS__).
+
+  Why a LaunchAgent (user session), NOT a LaunchDaemon (root, no session):
+  the build signs iOS apps and talks to a tethered iPhone. Code signing needs
+  the login keychain and your Apple signing identities, and xcodebuild/devicectl
+  need the GUI login session. A root daemon has none of those and would break
+  signing + device install. The tradeoff — an agent only runs once the user logs
+  in — is handled by enabling auto-login (the installer explains this), so after
+  a reboot the Mac logs in and the agent starts automatically.
+
+  launchd is the supervisor here: RunAtLoad starts it, KeepAlive restarts it if it
+  crashes. So this REPLACES the nohup + PID-file dance in start.sh/stop.sh; manage
+  it with dev/service.sh instead.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <!-- Run uvicorn directly; launchd keeps it alive. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__UVICORN__</string>
+        <string>app.server:app</string>
+        <string>--host</string>
+        <string>__HOST__</string>
+        <string>--port</string>
+        <string>__PORT__</string>
+    </array>
+
+    <!-- Run from the project root so `app.server:app` imports correctly. -->
+    <key>WorkingDirectory</key>
+    <string>__ROOT__</string>
+
+    <!-- Point the server at its config, same env the dev scripts use. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>UBS_CONFIG</key>
+        <string>__CONFIG__</string>
+        <!-- Ensure Homebrew + system tool paths are present for a login-less
+             agent start (xcrun, git, ugs, etc. live here). -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Start at load (i.e. at login / when bootstrapped). -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it exits for any reason. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Don't thrash on a crash loop: wait 30s between restarts. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Server stdout/stderr. Same log file the dev logs.sh tails. -->
+    <key>StandardOutPath</key>
+    <string>__LOGFILE__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOGFILE__</string>
+
+    <!-- Give the process its normal process-type priority. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

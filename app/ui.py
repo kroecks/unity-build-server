@@ -62,6 +62,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <body>
   <h1>Unity build machine</h1>
 
+  <div id="diskWarn" style="display:none; background:#7c2d12; color:#fed7aa;
+       border-radius:10px; padding:10px 12px; margin-bottom:12px; font-size:14px"></div>
+
   <div class="card">
     <label for="token">Build token <small class="hint">(stored on this device only)</small></label>
     <input id="token" type="password" placeholder="token" autocomplete="off">
@@ -127,6 +130,31 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <h2>Recent builds</h2>
   <div id="history"></div>
 
+  <div class="logbar" style="margin-top:14px">
+    <h2 style="margin:0">Storage</h2>
+    <span><button class="sec" id="loadDisk">Measure</button></span>
+  </div>
+  <div id="diskPanel" class="card meta" style="padding:10px 12px">
+    Tap “Measure” to see disk free and how much each project’s builds use.
+  </div>
+
+  <div class="logbar" style="margin-top:14px">
+    <h2 style="margin:0">All builds</h2>
+    <span>
+      <button class="sec" id="selectMode">Select</button>
+      <button class="sec" id="cleanupOld" title="Delete builds older than 7 days">Clean &gt;7d</button>
+    </span>
+  </div>
+  <div id="batchBar" class="logbar" style="display:none; background:#1a1d24; border-radius:8px; padding:8px 10px">
+    <span id="selCount">0 selected</span>
+    <span>
+      <button class="danger" id="batchDelete">Delete selected</button>
+      <button class="sec" id="selectCancel">Cancel</button>
+    </span>
+  </div>
+  <div id="allbuilds"></div>
+  <button class="sec full" id="loadMore" style="display:none; margin-top:8px">Load more</button>
+
 <script>
 const $ = id => document.getElementById(id);
 const token = () => $("token").value;
@@ -172,10 +200,17 @@ function projectCard(p) {
     <div class="btn-row">
       <button data-act="build" ${needs.length?"disabled":""}>Build${needs.length?" (configure first)":""}</button>
       <button class="sec" data-act="edit">Edit</button>
+      ${p.device_udid ? '<button class="sec" data-act="devlogs">Device logs (relaunch)</button>' : ""}
+      ${p.device_udid ? '<button class="sec" data-act="lastlogs">Last run logs</button>' : ""}
+      ${p.device_udid ? `<a href="/device-logs-zip/${p.id}"><button class="sec" title="Download all log sources as a zip">⤓ Logs zip</button></a>` : ""}
     </div>
     <div class="editArea" style="display:none"></div>`;
   el.querySelector('[data-act="build"]').onclick = () => startBuild(p);
   el.querySelector('[data-act="edit"]').onclick = () => toggleEdit(el, p);
+  const dl = el.querySelector('[data-act="devlogs"]');
+  if (dl) dl.onclick = () => streamDeviceLogs(p);
+  const ll = el.querySelector('[data-act="lastlogs"]');
+  if (ll) ll.onclick = () => streamLastRunLogs(p);
   return el;
 }
 
@@ -196,6 +231,23 @@ function toggleEdit(el, p) {
     <div class="toggle"><input type="checkbox" data-f="webhook_deploys" ${p.webhook_deploys?"checked":""}><label>Deploy to phone on git push</label></div>
     <div class="toggle"><input type="checkbox" data-f="reclaim_disk" ${p.reclaim_disk?"checked":""}><label>Uninstall other Unity versions to save space</label></div>
     <div class="toggle"><input type="checkbox" data-f="clean_ignored" ${p.clean_ignored?"checked":""}><label>git clean -fdx (nukes Library/, slower builds)</label></div>
+
+    <label style="margin-top:14px">Content / CCD <small class="hint">(per-project; auth is shared on the host)</small></label>
+    <div class="row">
+      <div><label>CCD project id</label><input type="text" data-f="ccd_project_id" value="${esc(p.ccd_project_id)}"></div>
+      <div><label>Environment</label><input type="text" data-f="ccd_environment" value="${esc(p.ccd_environment)}" placeholder="production"></div>
+    </div>
+    <div class="row">
+      <div><label>CCD bucket</label><input type="text" data-f="ccd_bucket" value="${esc(p.ccd_bucket)}"></div>
+      <div><label>Addressables profile</label><input type="text" data-f="addressables_profile" value="${esc(p.addressables_profile)}" placeholder="Development"></div>
+    </div>
+    <label>Remote build path <small class="hint">(where Addressables writes bundles, e.g. ServerData/iOS)</small></label>
+    <input type="text" data-f="remote_build_path" value="${esc(p.remote_build_path)}" placeholder="ServerData/iOS">
+    <label>Scripting defines <small class="hint">(semicolon-separated, e.g. TK_IOS_DEV — needed for CCD auth)</small></label>
+    <input type="text" data-f="scripting_defines" value="${esc(p.scripting_defines)}" placeholder="TK_IOS_DEV">
+    <label>Auto-merge from <small class="hint">(merge this branch into the build branch first; e.g. main → ios. Conflict aborts.)</small></label>
+    <input type="text" data-f="merge_from" value="${esc(p.merge_from)}" placeholder="main">
+    <div class="toggle"><input type="checkbox" data-f="auto_distribute" ${p.auto_distribute?"checked":""}><label>Auto-upload successful webhook builds to TestFlight</label></div>
 
     <label>Pre-build steps <small class="hint">(run in order before the build; first failure aborts)</small></label>
     <div id="steps-${p.id}"></div>
@@ -403,6 +455,43 @@ function stream(id) {
   es.onerror = () => {};
 }
 
+// Stream the device console into the log viewer (for runtime/addressables errors).
+function streamDeviceLogs(p) {
+  if (es) es.close();
+  currentBuildId = null; showStop(false); stopProgress();
+  liveLines = []; pending = []; truncatedCount = 0;
+  $("fulllogwrap").style.display = "none";
+  $("buildCard").style.display = "block";
+  $("buildTitle").textContent = "Device logs: " + p.name;
+  $("log").textContent = "Launching the app on the phone with console attached… (unlock the phone)\n";
+  setState("running");
+  $("buildCard").scrollIntoView({behavior:"smooth"});
+  es = new EventSource(`/device-logs/${p.id}`);
+  es.onmessage = e => { pending.push(e.data); scheduleFlush(); };
+  es.addEventListener("done", e => { flushLog(); setState("idle"); es.close(); });
+  es.onerror = () => {};
+}
+
+// Pull the LAST run's logs off the device WITHOUT relaunching the app, so a
+// crash or failure from a previous run is recoverable. Hits /device-logs-last,
+// which collects the unified log + any crash reports. Does not start the app.
+function streamLastRunLogs(p) {
+  if (es) es.close();
+  currentBuildId = null; showStop(false); stopProgress();
+  liveLines = []; pending = []; truncatedCount = 0;
+  $("fulllogwrap").style.display = "none";
+  $("buildCard").style.display = "block";
+  $("buildTitle").textContent = "Last run logs: " + p.name;
+  $("log").textContent = "Pulling the last run's logs from the phone (no relaunch)… "
+    + "this can take ~15-30s while the unified log is collected. Keep the phone unlocked.\n";
+  setState("running");
+  $("buildCard").scrollIntoView({behavior:"smooth"});
+  es = new EventSource(`/device-logs-last/${p.id}`);
+  es.onmessage = e => { pending.push(e.data); scheduleFlush(); };
+  es.addEventListener("done", e => { flushLog(); setState("idle"); es.close(); });
+  es.onerror = () => {};
+}
+
 // ---- elapsed timer / ETA / progress bar --------------------------------- //
 // Seeded from the server each status poll; ticks locally every second so it's
 // smooth. Bar fills elapsed/avg; past the ETA it turns amber and keeps counting.
@@ -510,16 +599,25 @@ const ICON = { success:"✓", failed:"✕", running:"●", queued:"…",
 async function refreshStatus() {
   let st;
   try { st = await (await fetch("/status")).json(); } catch(e){ return; }
+  // Disk-space banner: warn before writes start failing.
+  const dw = $("diskWarn");
+  if (st.disk_free_gb != null && st.disk_low) {
+    dw.style.display = "block";
+    dw.textContent = `⚠ Low disk on the build machine: ${st.disk_free_gb} GB free. `
+      + `Builds and saves may fail. Delete old build outputs under output_root.`;
+  } else { dw.style.display = "none"; }
   const wrap = $("history"); wrap.innerHTML = "";
 
-  // show the running build (and any queued) at the top
+  // #history shows ONLY the live running/queued builds; finished builds live in
+  // the paginated "All builds" list below (so nothing is hidden by a 10 cap).
   const active = [];
   if (st.current) active.push(st.current);
   for (const q of st.queued) active.push(q);
   for (const b of active) wrap.appendChild(historyRow(b, true));
-  for (const b of st.history) wrap.appendChild(historyRow(b, false));
   if (!wrap.children.length)
-    wrap.innerHTML = '<div class="card meta">No builds yet.</div>';
+    wrap.innerHTML = '<div class="card meta">No active builds.</div>';
+  // Keep the full list fresh too (cheap; shows newly-finished builds).
+  if (!selectModeOn) loadAllBuilds(true);
 
   // Drive the progress bar from the running build, but only while we're
   // actually viewing it (currentBuildId set by stream()). Re-seeds each poll so
@@ -531,6 +629,163 @@ async function refreshStatus() {
     stopProgress();
   }
 }
+
+// ---- paginated "All builds" list + batch delete ------------------------- //
+let allOffset = 0, allTotal = 0, allLoaded = [];
+let selectModeOn = false;
+const selected = new Set();
+const PAGE = 20;
+
+async function loadAllBuilds(reset) {
+  if (reset) { allOffset = 0; allLoaded = []; }
+  let data;
+  try { data = await api("GET", `/api/builds?offset=${allOffset}&limit=${PAGE}`); }
+  catch(e){ return; }
+  allTotal = data.total;
+  if (reset) allLoaded = data.builds;
+  else allLoaded = allLoaded.concat(data.builds);
+  renderAllBuilds();
+}
+function renderAllBuilds() {
+  const wrap = $("allbuilds"); wrap.innerHTML = "";
+  if (!allLoaded.length) { wrap.innerHTML = '<div class="card meta">No builds yet.</div>'; }
+  for (const b of allLoaded) wrap.appendChild(allBuildRow(b));
+  $("loadMore").style.display = allLoaded.length < allTotal ? "block" : "none";
+  $("loadMore").textContent = `Load more (${allLoaded.length} of ${allTotal})`;
+  $("selCount").textContent = `${selected.size} selected`;
+}
+function allBuildRow(b) {
+  const el = document.createElement("div");
+  el.className = "card"; el.style.padding = "9px 12px";
+  const when = esc(b.created_iso||""); const dur = b.elapsed!=null ? " · "+fmtDur(b.elapsed) : "";
+  const rc = (b.returncode!=null && b.state!=='success') ? " (rc="+b.returncode+")" : "";
+  // Action buttons on finished builds, so Install/Distribute/Download work
+  // straight from the list without opening the log. Hidden in select mode
+  // (where the whole row is a checkbox target) and while a build is in flight.
+  // Show for any SUCCESSFUL build (e.g. build ok but install failed while the
+  // phone was away) — the server returns a clean error if the artifact is gone.
+  // Download is gated on has_artifact since there must be a file to fetch.
+  const showActions = !selectModeOn && b.state === 'success';
+  const actions = showActions ? `
+    <div class="row" style="margin-top:8px;gap:6px">
+      ${b.has_artifact ? `<a href="${b.artifact_url}"><button class="sec">⤓ Download</button></a>` : ""}
+      <button class="sec" data-a="install">📲 Install</button>
+      <button class="sec" data-a="distribute">🚀 Distribute</button>
+    </div>` : "";
+  el.innerHTML = `
+    <div class="proj-head">
+      <div style="display:flex;align-items:center;gap:8px">
+        ${selectModeOn ? `<input type="checkbox" class="selbox" ${selected.has(b.id)?"checked":""}>` : ""}
+        <span class="${b.state}">${ICON[b.state]||"•"}</span>
+        <b>${esc(b.project_name)}</b>
+      </div>
+      <span class="badge">${esc(b.source)}</span>
+    </div>
+    <div class="meta">${when}${dur} · ${esc(b.state)}${rc}</div>${actions}`;
+  if (selectModeOn) {
+    const cb = el.querySelector(".selbox");
+    cb.onclick = (ev) => { ev.stopPropagation();
+      if (cb.checked) selected.add(b.id); else selected.delete(b.id);
+      $("selCount").textContent = `${selected.size} selected`; };
+    el.onclick = () => { cb.checked = !cb.checked; cb.onclick({stopPropagation(){}}); };
+  } else {
+    el.style.cursor = "pointer";
+    el.onclick = () => viewLog(b);
+    if (showActions) {
+      // Stop button clicks from also opening the log view.
+      const inst = el.querySelector('[data-a="install"]');
+      inst.onclick = async (ev) => { ev.stopPropagation();
+        inst.disabled = true; inst.textContent = "Installing…";
+        try { await api("POST", `/build/${b.project_id}/install/${b.id}`); refreshStatus(); }
+        catch(e){ alert("Install failed: " + e.message); }
+        finally { inst.disabled = false; inst.textContent = "📲 Install"; }
+      };
+      const dist = el.querySelector('[data-a="distribute"]');
+      dist.onclick = async (ev) => { ev.stopPropagation();
+        if (!confirm("Upload this build to TestFlight / App Store Connect?")) return;
+        dist.disabled = true; dist.textContent = "Uploading…";
+        try { await api("POST", `/build/${b.project_id}/distribute/${b.id}`); refreshStatus(); }
+        catch(e){ alert("Distribute failed: " + e.message); }
+        finally { dist.disabled = false; dist.textContent = "🚀 Distribute"; }
+      };
+      // The download link shouldn't bubble up to the row's viewLog handler either.
+      const dl = el.querySelector("a");
+      if (dl) dl.onclick = (ev) => ev.stopPropagation();
+    }
+  }
+  return el;
+}
+$("loadMore").onclick = () => { allOffset += PAGE; loadAllBuilds(false); };
+
+// ---- storage panel: disk free + per-project build sizes ----------------- //
+function gb(n){ return (n==null) ? "?" : n.toFixed(n<10?2:1)+" GB"; }
+function bar(pct){
+  const c = pct>=90 ? "#ef4444" : pct>=75 ? "#fbbf24" : "#34d399";
+  return `<div style="height:8px;background:#2a2f3a;border-radius:4px;overflow:hidden;margin:6px 0">
+    <div style="height:100%;width:${Math.min(100,pct||0)}%;background:${c}"></div></div>`;
+}
+$("loadDisk").onclick = async () => {
+  const panel = $("diskPanel");
+  panel.innerHTML = "Measuring… (walking build directories, a few seconds)";
+  let d;
+  try { d = await api("GET", "/api/disk"); }
+  catch(e){ panel.innerHTML = "Couldn't measure: " + esc(e.message); return; }
+  const v = d.volume || {};
+  let html = "";
+  if (v.total_gb != null) {
+    html += `<div><b>Volume</b> <span class="meta">${esc(v.path||"")}</span></div>`;
+    html += bar(v.used_pct);
+    html += `<div class="meta">${gb(v.free_gb)} free of ${gb(v.total_gb)} `
+         +  `· ${gb(v.used_gb)} used (${v.used_pct}%)</div>`;
+  } else {
+    html += `<div class="meta">Volume stats unavailable: ${esc(v.error||"")}</div>`;
+  }
+  html += `<div style="margin-top:10px"><b>Build output</b> — `
+       +  `${gb(d.builds_total_gb)} across ${d.project_count} project(s)</div>`;
+  for (const p of (d.projects||[])) {
+    const share = v.total_gb ? Math.round(p.bytes/ (v.total_gb*1e9) *100) : 0;
+    html += `<div style="margin-top:8px;border-top:1px solid #222;padding-top:8px">
+      <div style="display:flex;justify-content:space-between">
+        <b>${esc(p.project_name)}</b><span>${gb(p.gb)} · ${p.build_count} build(s)</span>
+      </div>
+      <div class="meta">biggest builds:</div>`;
+    for (const b of (p.builds||[]).slice(0,3)) {
+      html += `<div class="meta">&nbsp;&nbsp;${esc(b.build_id).slice(0,8)} — `
+           +  `${b.mb} MB · ${esc(b.mtime_iso)}</div>`;
+    }
+    html += `</div>`;
+  }
+  if (!(d.projects||[]).length) html += `<div class="meta">No build output on disk yet.</div>`;
+  panel.innerHTML = html;
+};
+
+$("selectMode").onclick = () => {
+  selectModeOn = true; selected.clear();
+  $("batchBar").style.display = "flex"; renderAllBuilds();
+};
+$("selectCancel").onclick = () => {
+  selectModeOn = false; selected.clear();
+  $("batchBar").style.display = "none"; renderAllBuilds();
+};
+$("batchDelete").onclick = async () => {
+  if (!selected.size) return;
+  if (!confirm(`Delete ${selected.size} build(s)? Output and logs are removed.`)) return;
+  try {
+    const r = await api("POST", "/api/builds/delete", { ids: [...selected] });
+    alert(`Deleted ${r.removed} of ${r.requested}.`);
+    selectModeOn = false; selected.clear(); $("batchBar").style.display = "none";
+    loadAllBuilds(true);
+  } catch(e){ alert("Batch delete failed: " + e.message); }
+};
+$("cleanupOld").onclick = async () => {
+  if (!confirm("Delete all builds older than 7 days?")) return;
+  try {
+    const r = await api("POST", "/api/builds/delete", { older_than_days: 7 });
+    alert(`Deleted ${r.removed} old build(s).`);
+    loadAllBuilds(true);
+  } catch(e){ alert("Cleanup failed: " + e.message); }
+};
+
 function historyRow(b, active) {
   const el = document.createElement("div");
   el.className = "card"; el.style.padding = "10px 12px"; el.style.cursor = "pointer";
@@ -552,7 +807,8 @@ function historyRow(b, active) {
       <span>${b.has_artifact ? "artifact ready" : ""}</span>
       <span>
         ${b.has_artifact ? `<a href="${b.artifact_url}"><button class="sec">⤓ Download</button></a>
-          <button class="sec" data-a="install">📲 Install</button>` : ""}
+          <button class="sec" data-a="install">📲 Install</button>
+          <button class="sec" data-a="distribute">🚀 Distribute</button>` : ""}
         <button class="danger" data-a="del">✕</button>
       </span>
     </div>` : ""}`;
@@ -571,6 +827,12 @@ function historyRow(b, active) {
   if (inst) inst.onclick = async () => {
     try { await api("POST", `/build/${b.project_id}/install/${b.id}`); refreshStatus(); }
     catch(e){ alert("Install failed: " + e.message); }
+  };
+  const dist = el.querySelector('[data-a="distribute"]');
+  if (dist) dist.onclick = async () => {
+    if (!confirm("Export this build and upload it to TestFlight?")) return;
+    try { await api("POST", `/build/${b.project_id}/distribute/${b.id}`); refreshStatus(); }
+    catch(e){ alert("Distribute failed: " + e.message); }
   };
   const del = el.querySelector('[data-a="del"]');
   if (del) del.onclick = async () => {

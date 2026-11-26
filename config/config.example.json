@@ -9,5 +9,10 @@
   "keep_builds_per_project": 10,
 
   "build_token": "CHANGE-ME-a-passphrase-or: openssl rand -hex 24",
-  "gitea_webhook_secret": "CHANGE-ME-matches-every-gitea-webhook-secret"
+  "gitea_webhook_secret": "CHANGE-ME-matches-every-gitea-webhook-secret",
+
+  "asc_key_id": "",
+  "asc_issuer_id": "",
+  "asc_key_path": "~/private_keys/AuthKey_XXXXXXXXXX.p8",
+  "_asc_note": "App Store Connect TEAM key (not Individual) for TestFlight upload. Find key_id + issuer_id in ASC -> Users and Access -> Integrations -> Team Keys."
 }
