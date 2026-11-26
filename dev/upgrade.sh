@@ -21,20 +21,16 @@ REGISTRY="$ROOT/config/projects.json"
 
 echo "== Unity build server upgrade =="
 
-# 0. Refuse to upgrade while a build is RUNNING, unless --force. Stopping the
-#    server orphans the in-flight build (Unity keeps running, untracked, holding
-#    the project lock). Let the queue drain or cancel the build first.
+# 0. A running build is fine: builds run under a detached runner and the
+#    restarted server reattaches to it (and to the queue). Just say so.
 PORT="${PORT:-8712}"
-if [[ "${1:-}" != "--force" && "${2:-}" != "--force" ]]; then
-  if command -v curl >/dev/null; then
-    RUNNING="$(curl -fsS "http://127.0.0.1:$PORT/status" 2>/dev/null \
-      | python3 -c 'import sys,json; d=json.load(sys.stdin); print("yes" if d.get("current") else "no")' 2>/dev/null || echo "unknown")"
-    if [[ "$RUNNING" == "yes" ]]; then
-      echo "A build is currently RUNNING. Upgrading now would orphan it."
-      echo "  Wait for it to finish (or press Stop in the UI), then re-run."
-      echo "  To upgrade anyway and abandon the running build: add --force"
-      exit 1
-    fi
+if command -v curl >/dev/null; then
+  RUNNING="$(curl -fsS "http://127.0.0.1:$PORT/status" 2>/dev/null \
+    | python3 -c 'import sys,json; d=json.load(sys.stdin); c=d.get("current"); print(c["project_name"] if c else "")' 2>/dev/null || true)"
+  if [[ -n "$RUNNING" ]]; then
+    echo "A build of $RUNNING is running; it keeps running through the upgrade and"
+    echo "the new server picks it up again (it runs a snapshot of build.sh, so"
+    echo "script changes apply from the next build)."
   fi
 fi
 

@@ -56,6 +56,13 @@
     <key>KeepAlive</key>
     <true/>
 
+    <!-- Builds run under a detached runner (app/runner.py) in their own
+         session, so they outlive a restart of the server. launchd only kills
+         the job's own process group on exit, which already excludes them;
+         this makes that explicit so a restart never takes a build with it. -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+
     <!-- Don't thrash on a crash loop: wait 30s between restarts. -->
     <key>ThrottleInterval</key>
     <integer>30</integer>

@@ -109,6 +109,46 @@ endpoints take `?device=<id>`.
 One global queue — only one Unity build runs at a time across all projects
 (two builds sharing a Library/ would corrupt it).
 
+## Builds survive server restarts
+
+Restart, upgrade or crash the server mid-build and the build carries on; the
+new server picks it up again.
+
+- Each build runs under `app/runner.py`, a small detached process in its own
+  session. It owns `build.sh`'s output and writes the log,
+  `<id>.phases.jsonl` (phase timestamps) and, at the end, `<id>.exit.json`
+  (exit code) into `log_dir`. The server only follows those files, so it
+  doesn't need to stay alive for the build to finish.
+- The running build and the queue are saved to `log_dir/active.json` on every
+  change. On startup the server reloads the queue and checks the build that
+  was running: if it's still running, it is picked up again (live log, timing,
+  Stop all work); if it finished while the server was down, it's recorded with
+  its real exit code and end time; if its process is gone (e.g. the Mac
+  rebooted), it's marked **interrupted**. A build stopped before it had
+  started (during the device scan) simply runs again.
+- Each build runs a **snapshot** of `scripts/` copied into its output dir
+  (`.ubs-scripts/`), so editing or pulling `build.sh` mid-build only affects
+  the next build.
+- The log stream resumes where it left off: the page reconnects on its own
+  after a restart, with no repeated lines.
+- `dev/upgrade.sh` no longer refuses to run during a build. Re-run
+  `./dev/install-service.sh` once to pick up `AbandonProcessGroup` in the
+  LaunchAgent plist.
+
+## Host load bar
+
+A bar pinned to the top of the page shows the mini's **CPU**, **memory** and
+**disk** (the fullest of the output / builds / log volumes), each with a
+10-minute sparkline. On the CPU sparkline, the dashed line is the running
+build's own share. The pill reads **Headroom / Busy / Saturated** from
+1-minute average CPU, memory (swapping counts against it) and a nearly-full
+disk. Tap the bar for load average, swap, disk I/O, the build's process tree
+(CPU in cores, RSS, top processes) and per-volume free space.
+
+Sampled every 3 s by the server (`psutil`, in requirements.txt; without it
+CPU falls back to load average and the I/O / per-build rows are hidden).
+API: `GET /api/host`.
+
 ## One-time setup on the Mac mini
 
 ```bash
@@ -183,6 +223,8 @@ app/server.py        FastAPI app: projects API, browser, builds, webhook
 app/registry.py      JSON-backed project store
 app/onboarding.py    clone / adopt / verify / install BuildScript.cs
 app/ui.py            the phone + config web UI
+app/runner.py        detached build runner (lets builds outlive the server)
+app/hoststats.py     CPU / memory / disk sampler for the load bar
 scripts/build.sh     the build pipeline (all inputs via env from the server)
 config/config.example.json
 config/com.local.unitybuild.plist

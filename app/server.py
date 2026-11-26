@@ -23,7 +23,8 @@ Endpoints
   POST /build/{id}            enqueue a build (token-gated)
   POST /webhook/gitea         enqueue by matching repo URL (HMAC-verified)
   GET  /status                queue + running + history
-  GET  /logs/{build_id}       SSE live log
+  GET  /logs/{build_id}       SSE live log (resumes via Last-Event-ID)
+  GET  /api/host              CPU / memory / disk of the build machine
   GET  /logs/{build_id}/raw   full log text
 
 Security unchanged from before: bind to the LAN IP, token on /build, HMAC on
@@ -39,6 +40,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from collections import deque
@@ -54,6 +56,7 @@ from .registry import Registry, Project, RegistryWriteError
 from . import onboarding
 from . import devices as devmod
 from . import repostatus
+from . import hoststats
 from .ui import INDEX_HTML
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +189,9 @@ class Build:
     # online and handed to the build script.
     devices: list = field(default_factory=list)
     deployed_to: list = field(default_factory=list)
+    # pid of the detached runner (app/runner.py) executing this build. It's a
+    # session leader, so it is also the process group to signal on cancel.
+    runner_pid: int = 0
 
     def duration(self) -> Optional[float]:
         if self.started_at is None:
@@ -217,6 +223,7 @@ class Build:
             d["version_label"] = ""
         d["commit_short"] = (self.commit_sha or "")[:8]
         d.pop("phases", None)
+        d.pop("runner_pid", None)
         d["timing"] = self.timing()
         d["device_names"] = [_device_name(x) for x in (self.deployed_to or self.devices)]
         return d
@@ -238,27 +245,33 @@ class Build:
 QUEUE: "deque[Build]" = deque()
 HISTORY: "deque[Build]" = deque(maxlen=500)   # keep plenty; UI pages through them
 CURRENT: Optional[Build] = None
-CURRENT_PROC = None          # the running build subprocess, for cancellation
 _wakeup = asyncio.Event()
+# A build that was running when the server last stopped and whose runner is
+# still alive (or finished while we were down). The worker adopts it before
+# starting anything new. Set by load_active() at startup.
+_REATTACH: Optional[Build] = None
 
 # Persist finished builds so history survives a server restart.
 HISTORY_PATH = LOG_DIR / "history.json"
+# The running build + the queue, so both survive a restart too.
+ACTIVE_PATH = LOG_DIR / "active.json"
+RUNNER = Path(__file__).with_name("runner.py")
+_BUILD_FIELDS = set(Build.__dataclass_fields__)
+
+
+def _build_from_rec(rec: dict) -> Build:
+    return Build(**{k: v for k, v in rec.items() if k in _BUILD_FIELDS})
+
+
+def _write_json(path: Path, data) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
 
 
 def save_history() -> None:
     try:
-        data = [{"id": b.id, "project_id": b.project_id, "project_name": b.project_name,
-                 "source": b.source, "deploy": b.deploy, "state": b.state,
-                 "created_at": b.created_at, "started_at": b.started_at,
-                 "finished_at": b.finished_at, "returncode": b.returncode,
-                 "output_dir": b.output_dir, "artifact": b.artifact,
-                 "version": b.version, "build_number": b.build_number,
-                 "commit_sha": b.commit_sha, "label": b.label, "platform": b.platform,
-                 "phases": b.phases, "devices": b.devices, "deployed_to": b.deployed_to}
-                for b in list(HISTORY)]
-        tmp = HISTORY_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        os.replace(tmp, HISTORY_PATH)
+        _write_json(HISTORY_PATH, [asdict(b) for b in list(HISTORY)])
     except Exception:
         pass  # history is a convenience; never let it break a build
 
@@ -268,23 +281,129 @@ def load_history() -> None:
         return
     try:
         for rec in json.loads(HISTORY_PATH.read_text()):
-            # A build left "running"/"queued" when the server died didn't finish.
+            # Old servers could leave these in history; they didn't finish.
             if rec.get("state") in ("running", "queued"):
                 rec["state"] = "interrupted"
-            HISTORY.append(Build(**{k: rec[k] for k in
-                ("id", "project_id", "project_name", "source", "deploy",
-                 "state", "created_at", "started_at", "finished_at",
-                 "returncode", "output_dir", "artifact",
-                 "version", "build_number", "commit_sha", "label", "platform", "phases",
-                 "devices", "deployed_to")
-                if k in rec}))
+            HISTORY.append(_build_from_rec(rec))
     except Exception:
         pass
+
+
+def save_active() -> None:
+    """Snapshot the running build and the queue. Called on every change, so a
+    restart (or crash) at any point picks up exactly where things were."""
+    try:
+        _write_json(ACTIVE_PATH, {"current": asdict(CURRENT) if CURRENT else None,
+                                  "queue": [asdict(b) for b in QUEUE]})
+    except Exception as e:
+        print(f"[ubs] could not save {ACTIVE_PATH}: {e!r}", flush=True)
+
+
+def _phases_path(b: Build) -> Path:
+    return LOG_DIR / f"{b.id}.phases.jsonl"
+
+
+def _exit_path(b: Build) -> Path:
+    return LOG_DIR / f"{b.id}.exit.json"
+
+
+def _read_exit(b: Build) -> Optional[dict]:
+    try:
+        return json.loads(_exit_path(b).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _runner_alive(pid: int, build_id: str, verify_cmdline: bool = False) -> bool:
+    """Is `pid` still the runner for this build? verify_cmdline guards against
+    pid reuse after a reboot or a long outage (checked once, on reattach)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False          # someone else's process now
+    if not verify_cmdline:
+        return True
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return True           # can't tell; assume it's ours rather than orphan it
+    return "runner.py" in out and build_id in out
+
+
+def load_active() -> None:
+    """Restore the queue and figure out what happened to the build that was
+    running when the server stopped: still running (adopt it), finished while
+    we were down (adopt it; it'll be finalized right away), or gone (e.g. the
+    Mac rebooted) → interrupted."""
+    global _REATTACH
+    if not ACTIVE_PATH.exists():
+        return
+    try:
+        data = json.loads(ACTIVE_PATH.read_text())
+    except Exception as e:
+        print(f"[ubs] ignoring unreadable {ACTIVE_PATH}: {e!r}", flush=True)
+        return
+    known = {b.id for b in HISTORY}
+    for rec in data.get("queue") or []:
+        if rec.get("id") not in known:
+            b = _build_from_rec(rec); b.state = "queued"
+            QUEUE.append(b)
+    cur = data.get("current")
+    if cur and cur.get("id") not in known:
+        b = _build_from_rec(cur)
+        if not b.runner_pid and _read_exit(b) is None:
+            # Stopped before its runner started (e.g. during the device scan):
+            # nothing ran, so just run it again first.
+            b.state = "queued"; b.started_at = None
+            QUEUE.appendleft(b)
+        elif _read_exit(b) is not None or _runner_alive(b.runner_pid, b.id, verify_cmdline=True):
+            _REATTACH = b
+            print(f"[ubs] reattaching to build {b.id} ({b.project_name}), "
+                  f"runner pid {b.runner_pid}", flush=True)
+        else:
+            b.state = "interrupted"
+            b.finished_at = b.finished_at or time.time()
+            _load_phases(b)
+            try:
+                with open(b.log_path, "a") as lf:
+                    lf.write("\n=== interrupted: the build process was gone when the "
+                             "server restarted (host reboot?) ===\n")
+            except OSError:
+                pass
+            HISTORY.appendleft(b); save_history()
+    if _REATTACH or QUEUE:
+        _wakeup.set()
+
+
+def _load_phases(b: Build) -> None:
+    """Phase timings come from the runner's phases file (absolute timestamps),
+    turned into offsets from started_at."""
+    try:
+        lines = _phases_path(b).read_text().splitlines()
+    except OSError:
+        return
+    base = b.started_at or 0
+    out = []
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+            out.append({"name": r["name"], "start": max(0.0, r["t"] - base)})
+        except (ValueError, KeyError, TypeError):
+            continue
+    if out or not b.phases:
+        b.phases = out
 
 
 def find_build(build_id: str) -> Optional[Build]:
     if CURRENT and CURRENT.id == build_id:
         return CURRENT
+    if _REATTACH and _REATTACH.id == build_id:
+        return _REATTACH
     for b in list(QUEUE) + list(HISTORY):
         if b.id == build_id:
             return b
@@ -496,67 +615,114 @@ async def run_build(build: Build, project: Project) -> None:
         "UBS_ASC_ISSUER_ID": ASC_ISSUER_ID,
         "UBS_ASC_KEY_PATH": ASC_KEY_PATH,
     })
-    global CURRENT_PROC
+    # Run a snapshot of scripts/, not the live copy: bash reads a script as it
+    # goes, so editing/pulling build.sh mid-build could otherwise change (or
+    # break) a build that's already running. The snapshot lives with the output.
+    script = BUILD_SCRIPT
+    try:
+        snap = out_dir / ".ubs-scripts"
+        shutil.copytree(Path(BUILD_SCRIPT).parent, snap, dirs_exist_ok=True)
+        script = str(snap / Path(BUILD_SCRIPT).name)
+    except Exception as e:
+        target_notes.append(f"(could not snapshot build scripts, running live copy: {e!r})")
     with open(build.log_path, "w") as logf:
         logf.write(f"=== build {build.id} | {project.name} | {time.ctime()} ===\n")
         if target_notes:
             logf.write("=== deploy targets ===\n")
             for n in target_notes:
                 logf.write(f"    {n}\n")
-        logf.flush()
+    for stale in (_phases_path(build), _exit_path(build)):
+        stale.unlink(missing_ok=True)
+    if build.state == "cancelled":       # cancelled while devices were scanned
+        finalize_build(build, project, None)
+        return
+    proc = None
+    try:
+        # The runner (app/runner.py) owns build.sh's output pipe and records
+        # phases + exit code to files, so this server can stop/restart without
+        # touching the build. It gets its own session (setsid), so it's also
+        # the process group cancel signals — Unity/xcodebuild included.
+        # Plain Popen, NOT asyncio: asyncio kills its subprocesses when the
+        # event loop closes, which is exactly what we're avoiding.
+        with open(build.log_path, "ab") as lf:   # runner's own errors, if any
+            proc = subprocess.Popen(
+                [sys.executable, "-I", str(RUNNER), build.id, str(build.log_path),
+                 str(_phases_path(build)), str(_exit_path(build)),
+                 "--", "/bin/bash", script],
+                stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, env=env,
+                start_new_session=True, close_fds=True)
+        build.runner_pid = proc.pid
+        save_active()
+        rc = await supervise(build, proc)
+    except Exception as e:
+        finalize_build(build, project, -1, error=f"server error starting build: {e!r}")
+        return
+    finalize_build(build, project, rc)
+
+
+async def supervise(build: Build, proc: Optional[subprocess.Popen] = None) -> Optional[int]:
+    """Follow a build's runner until it ends; return the build's exit code, or
+    None if the runner vanished without recording one. `proc` is set when we
+    started the runner ourselves (so we can reap it); after a restart we only
+    have its pid."""
+    phases_mtime = 0.0
+    while True:
         try:
-            # Launch in its own process group so cancel can kill Unity/xcodebuild
-            # too, not just the top-level bash (which would orphan them and leave
-            # the project lock held).
-            # NOTE: raise the stream buffer limit AND read in fixed-size chunks
-            # (not line-by-line). IL2CPP/Xcode emit single lines far longer than
-            # asyncio's default 64 KB readline limit; `async for line in stdout`
-            # throws "Separator is not found, and chunk exceeded the limit" on
-            # those and kills the reader mid-build. Chunked reads can't overflow.
-            proc = await asyncio.create_subprocess_exec(
-                "/bin/bash", BUILD_SCRIPT,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT, env=env,
-                start_new_session=True,   # setsid: new process group
-                limit=1024 * 1024,        # 1 MB stream buffer (was 64 KB default)
-            )
-            CURRENT_PROC = proc
-            pending = ""   # partial last line carried between chunks
-            while True:
-                chunk = await proc.stdout.read(65536)
-                if not chunk:
-                    break
-                text = chunk.decode(errors="replace")
-                logf.write(text); logf.flush()
-                # Timestamp each phase header as it arrives (the log itself has
-                # no timestamps, so this is the only place we can learn them).
-                pending += text
-                lines = pending.split("\n")
-                pending = lines.pop()
-                if len(pending) > 65536:
-                    pending = ""   # giant unterminated line (IL2CPP); not a header
-                for ln in lines:
-                    name = _phase_header(ln)
-                    if name:
-                        build.phases.append({"name": name,
-                                             "start": time.time() - build.started_at})
-            rc = await proc.wait()
-            build.returncode = rc
-            if build.state == "cancelled":
-                logf.write(f"\n=== cancelled by user (rc={rc}) ===\n")
-            else:
-                build.state = "success" if rc == 0 else "failed"
-                logf.write(f"\n=== finished rc={rc} ({build.state}) ===\n")
-        except Exception as e:
-            build.state = "failed"; build.returncode = -1
-            logf.write(f"\n=== server error: {e!r} ===\n")
-        finally:
-            CURRENT_PROC = None
-    build.finished_at = time.time()
+            mt = _phases_path(build).stat().st_mtime
+            if mt != phases_mtime:
+                phases_mtime = mt
+                _load_phases(build)
+        except OSError:
+            pass
+        ex = _read_exit(build)
+        if ex is not None:
+            if proc is not None:
+                await asyncio.to_thread(proc.wait)
+            _load_phases(build)
+            return int(ex.get("rc", -1))
+        gone = (proc.poll() is not None) if proc is not None else \
+            not _runner_alive(build.runner_pid, build.id)
+        if gone:
+            ex = _read_exit(build)     # it may have written it just before exiting
+            _load_phases(build)
+            if ex is not None:
+                return int(ex.get("rc", -1))
+            return proc.returncode if proc is not None else None
+        await asyncio.sleep(1.0)
+
+
+def finalize_build(build: Build, project: Optional[Project], rc: Optional[int],
+                   error: str = "") -> None:
+    """Record the outcome of a build (fresh or reattached) and run the
+    post-build steps: artifact, version info, history, retention, auto-distribute.
+    rc None = the runner vanished without recording an exit code."""
+    global CURRENT
+    CURRENT = build
+    build.returncode = rc
+    with open(build.log_path, "a") as logf:
+        if build.state == "cancelled":
+            logf.write(f"\n=== cancelled by user (rc={rc}) ===\n")
+        elif error:
+            build.state = "failed"
+            logf.write(f"\n=== {error} ===\n")
+        elif rc is None:
+            build.state = "interrupted"
+            logf.write("\n=== interrupted: the build process ended without reporting "
+                       "an exit code ===\n")
+        else:
+            build.state = "success" if rc == 0 else "failed"
+            logf.write(f"\n=== finished rc={rc} ({build.state}) ===\n")
+    build.finished_at = build.finished_at or time.time()
+    ex = _read_exit(build)
+    if ex and ex.get("finished_at"):
+        build.finished_at = float(ex["finished_at"])   # true end, even if we were down
     dur = build.duration()
     if dur is not None:
         with open(build.log_path, "a") as lf:
             lf.write(f"=== duration: {dur:.0f}s ===\n")
+    for f in (_phases_path(build), _exit_path(build)):
+        f.unlink(missing_ok=True)
+    platform = build.platform if build.platform in PLATFORMS else "ios"
     # Find the artifact the build produced (ipa > archive > app on iOS; apk > aab on Android).
     build.artifact = _find_artifact(Path(build.output_dir), platform) if build.output_dir else ""
     # Read back version/commit the build script recorded (build-info.json in the
@@ -585,18 +751,20 @@ async def run_build(build: Build, project: Project) -> None:
     save_history()
     prune_outputs(build.project_id)
     CURRENT = None
+    save_active()
     # The repo status panel compares against the last build; refresh it now.
     schedule_repo_status(build.project_id, force=True)
     # Auto-distribute: a successful webhook build of a project that opted in gets
     # queued for TestFlight upload (only if ASC is configured). Never auto-distribute
     # install/distribute runs themselves, or manual/failed builds.
-    if (build.state == "success" and build.source == "gitea" and platform == "ios"
+    if (project and build.state == "success" and build.source == "gitea" and platform == "ios"
             and project.auto_distribute and ASC_KEY_ID and ASC_ISSUER_ID and ASC_KEY_PATH):
         archive = _find_archive(build)
         if archive:
             nb = enqueue(project, "distribute", False)
             if nb:
                 nb.artifact = archive
+                save_active()
 
 
 _ARTIFACT_PATTERNS = {
@@ -661,7 +829,24 @@ def prune_outputs(project_id: str) -> None:
         pass
 
 
+async def _adopt(build: Build) -> None:
+    """Finish following a build that was running before the server restarted."""
+    global CURRENT
+    CURRENT = build
+    save_active()
+    try:
+        rc = await supervise(build)
+    except Exception as e:
+        print(f"[ubs] lost track of reattached build {build.id}: {e!r}", flush=True)
+        rc = None
+    finalize_build(build, reg.get(build.project_id), rc)
+
+
 async def worker_loop() -> None:
+    global _REATTACH
+    if _REATTACH is not None:
+        b, _REATTACH = _REATTACH, None
+        await _adopt(b)
     while True:
         if not QUEUE:
             _wakeup.clear(); await _wakeup.wait(); continue
@@ -671,8 +856,14 @@ async def worker_loop() -> None:
             build.state = "failed"
             build.log_path.write_text("project no longer exists\n" if not project
                                       else "project is not onboarded yet (clone unfinished)\n")
-            HISTORY.appendleft(build); save_history(); continue
-        await run_build(build, project)
+            HISTORY.appendleft(build); save_history(); save_active(); continue
+        try:
+            await run_build(build, project)
+        except Exception as e:
+            # Never let one bad build stop the queue.
+            print(f"[ubs] build {build.id} crashed the worker: {e!r}", flush=True)
+            if CURRENT is build:
+                finalize_build(build, project, -1, error=f"server error: {e!r}")
 
 
 # --------------------------------------------------------------------------- #
@@ -709,7 +900,9 @@ def _require_ready(proj: Project) -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     load_history()
+    load_active()      # queue + the build that was running before the restart
     asyncio.create_task(worker_loop())
+    asyncio.create_task(hoststats.sampler(_build_pid))
     # A clone that was mid-download when the server stopped picks up where it
     # left off (the project dir and record are already there).
     for p in reg.list():
@@ -734,6 +927,7 @@ def enqueue(project: Project, source: str, deploy: bool, coalesce: bool = False,
               project_name=project.name, source=source, deploy=deploy,
               platform=project.platform or "ios", devices=list(devices or []))
     QUEUE.append(b); _wakeup.set()
+    save_active()
     return b
 
 
@@ -1167,19 +1361,22 @@ async def cancel_build(build_id: str, x_build_token: str = Header(default="")):
     _check_token(x_build_token)
     # Case 1: the running build.
     if CURRENT and CURRENT.id == build_id:
-        CURRENT.state = "cancelled"          # run_build sees this and labels it
-        proc = CURRENT_PROC
-        if proc and proc.returncode is None:
+        cur = CURRENT
+        cur.state = "cancelled"          # finalize_build sees this and labels it
+        save_active()                    # a restart mid-cancel stays cancelled
+        pid = cur.runner_pid
+        # The runner is a session leader: its pid is the process group that
+        # holds build.sh, Unity and xcodebuild. Works for reattached builds too.
+        if _runner_alive(pid, cur.id):
             try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGTERM)          # ask the whole group to stop
+                os.killpg(pid, signal.SIGTERM)           # ask the whole group to stop
                 # Escalate to SIGKILL shortly if it's still alive.
-                async def _hard_kill(p, g):
+                async def _hard_kill(b, g):
                     await asyncio.sleep(8)
-                    if p.returncode is None:
+                    if _read_exit(b) is None and _runner_alive(g, b.id):
                         try: os.killpg(g, signal.SIGKILL)
                         except ProcessLookupError: pass
-                asyncio.create_task(_hard_kill(proc, pgid))
+                asyncio.create_task(_hard_kill(cur, pid))
             except ProcessLookupError:
                 pass
         return {"cancelling": True, "build_id": build_id}
@@ -1190,7 +1387,7 @@ async def cancel_build(build_id: str, x_build_token: str = Header(default="")):
             try: QUEUE.remove(b)
             except ValueError: pass
             b.log_path.write_text("=== cancelled before it started ===\n")
-            HISTORY.appendleft(b); save_history()
+            HISTORY.appendleft(b); save_history(); save_active()
             return {"cancelled": True, "build_id": build_id}
     raise HTTPException(status_code=404, detail="build not running or queued")
 
@@ -1501,6 +1698,26 @@ async def status():
     }
 
 
+# Host utilisation widget (see app/hoststats.py). Watch the volumes builds use.
+hoststats.VOLUMES = [OUTPUT_ROOT, BUILDS_ROOT, LOG_DIR]
+
+
+def _build_pid() -> int:
+    b = CURRENT
+    return b.runner_pid if (b and b.state in ("running", "cancelled")) else 0
+
+
+@app.get("/api/host")
+async def api_host():
+    """CPU / memory / disk / I/O of the build machine, plus what the running
+    build's process tree uses, with ~10 min of history for sparklines."""
+    snap = hoststats.snapshot()
+    snap["building"] = bool(CURRENT)
+    snap["build_project"] = CURRENT.project_name if CURRENT else ""
+    snap["queued"] = len(QUEUE)
+    return snap
+
+
 @app.get("/logs/{build_id}/raw", response_class=PlainTextResponse)
 async def logs_raw(build_id: str):
     b = find_build(build_id)
@@ -1521,28 +1738,57 @@ async def build_timing(build_id: str):
 
 
 @app.get("/logs/{build_id}")
-async def logs_stream(build_id: str):
+async def logs_stream(build_id: str, request: Request):
+    """SSE live log. Every event carries the byte offset just past its line as
+    its id, so when the connection drops (e.g. the server restarts mid-build)
+    the browser's automatic reconnect sends Last-Event-ID and the stream
+    resumes exactly there instead of replaying the whole log."""
     b = find_build(build_id)
     if not b:
         raise HTTPException(status_code=404, detail="no such build")
+    try:
+        start = max(0, int(request.headers.get("last-event-id") or 0))
+    except ValueError:
+        start = 0
 
     async def gen():
-        last = 0
+        pos = start
+        buf = b""
+        if start:
+            yield "retry: 2000\n\n"
         while True:
             p = b.log_path
+            finished = b.state in ("success", "failed", "cancelled", "interrupted")
             if p.exists():
                 size = p.stat().st_size
-                if size > last:
-                    with open(p) as f:
-                        f.seek(last); chunk = f.read(); last = size
-                    for line in chunk.splitlines():
-                        yield f"data: {line}\n\n"
-            if b.state in ("success", "failed", "cancelled", "interrupted") and (
-                not p.exists() or p.stat().st_size <= last):
+                if size < pos:            # log was rewritten (shouldn't happen); start over
+                    pos, buf = 0, b""
+                if size > pos:
+                    with open(p, "rb") as f:
+                        f.seek(pos); data = f.read(size - pos)
+                    pos += len(data)
+                    buf += data
+                    # Only whole lines, so a reconnect never splits one; a giant
+                    # unterminated line (IL2CPP) is flushed once it's huge.
+                    *lines, buf = buf.split(b"\n")
+                    if len(buf) > 262144:
+                        lines.append(buf); buf = b""
+                    off = pos - len(buf)
+                    for i, line in enumerate(lines):
+                        txt = line.decode(errors="replace").rstrip("\r")
+                        # id only on the last event of the batch (offset after it)
+                        if i == len(lines) - 1:
+                            yield f"id: {off}\ndata: {txt}\n\n"
+                        else:
+                            yield f"data: {txt}\n\n"
+            if finished and (not p.exists() or p.stat().st_size <= pos):
+                if buf:
+                    yield f"id: {pos}\ndata: {buf.decode(errors='replace')}\n\n"
                 yield f"event: done\ndata: {b.state}\n\n"; break
             await asyncio.sleep(0.5)
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # --------------------------------------------------------------------------- #
@@ -2212,6 +2458,7 @@ async def install_artifact(project_id: str, build_id: str, request: Request,
     # Enqueue a lightweight install-only build; the script sees UBS_INSTALL_ONLY.
     nb = enqueue(proj, "install", True, devices=devs)
     nb.artifact = b.artifact
+    save_active()
     return JSONResponse(nb.public())
 
 
@@ -2235,6 +2482,7 @@ async def distribute_build(project_id: str, build_id: str, x_build_token: str = 
         raise HTTPException(status_code=404, detail="no .xcarchive for this build to distribute")
     nb = enqueue(proj, "distribute", False)
     nb.artifact = archive   # the build script reads this as UBS_DISTRIBUTE_ARCHIVE
+    save_active()
     return JSONResponse(nb.public())
 
 
@@ -2295,7 +2543,7 @@ async def label_build(build_id: str, request: Request, x_build_token: str = Head
         raise HTTPException(status_code=404, detail="no such build")
     body = await request.json()
     b.label = str(body.get("label", ""))[:120]
-    save_history()
+    save_history(); save_active()
     return b.public()
 
 

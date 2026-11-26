@@ -119,10 +119,61 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .st-foot { display:flex; justify-content:space-between; align-items:center; margin-top:4px;
              font-size:11px; opacity:.55; }
   .st-foot button { padding:2px 8px; font-size:11px; background:transparent; color:inherit; border:1px solid #2a2f3a; }
+  /* host utilisation bar: sticks to the top while scrolling */
+  .hostbar { position:sticky; top:0; z-index:40; margin:0 -16px 12px; padding:8px 16px 8px;
+             background:rgba(15,17,21,.92); -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px);
+             border-bottom:1px solid #2a2f3a; cursor:pointer; user-select:none; }
+  .hb-row { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)) auto; gap:10px; align-items:end; }
+  .hm-top { display:flex; justify-content:space-between; align-items:baseline; font-size:11px; }
+  .hm-l { opacity:.6; letter-spacing:.05em; }
+  .hm-v { font-weight:600; font-size:13px; font-variant-numeric:tabular-nums; }
+  .hm-top { white-space:nowrap; gap:4px; }
+  .hm-cap { font-size:10px; opacity:.55; margin-top:3px; white-space:nowrap; overflow:hidden;
+            text-overflow:ellipsis; font-variant-numeric:tabular-nums; min-height:1.2em; }
+  .hm svg { display:block; width:100%; height:18px; margin:2px 0 3px; }
+  .hm svg polyline { fill:none; stroke-width:1.5; vector-effect:non-scaling-stroke; stroke-linejoin:round; }
+  .hm svg polyline.b { stroke:#93c5fd; opacity:.55; stroke-dasharray:2 2; }
+  .hm-bar { height:4px; background:#2a2f3a; border-radius:3px; overflow:hidden; }
+  .hm-bar > div { height:100%; width:0; border-radius:3px; transition:width .6s ease, background .3s; }
+  .lvl-ok { --c:#22c55e; } .lvl-mid { --c:#f59e0b; } .lvl-hi { --c:#ef4444; }
+  .hm .hm-bar > div { background:var(--c,#3b82f6); }
+  .hm svg polyline.m { stroke:var(--c,#3b82f6); }
+  .hb-pill { font-size:11px; font-weight:600; padding:3px 8px; border-radius:20px; white-space:nowrap;
+             background:#2a2f3a; }
+  .hb-pill.lvl-ok { background:#14532d; color:#bbf7d0; }
+  .hb-pill.lvl-mid { background:#78350f; color:#fde68a; }
+  .hb-pill.lvl-hi { background:#7f1d1d; color:#fecaca; }
+  .hb-side { display:flex; flex-direction:column; align-items:center; gap:4px; align-self:center; }
+  .hb-more { font-size:10px; opacity:.55; white-space:nowrap; }
+  .hb-more .caret { display:inline-block; transition:transform .15s; }
+  .hostbar[aria-expanded="true"] .hb-more .caret { transform:rotate(180deg); }
+  .hb-detail { display:none; margin-top:8px; font-size:12px; border-top:1px solid #2a2f3a; padding-top:6px; }
+  .hostbar[aria-expanded="true"] .hb-detail { display:block; max-height:38vh; overflow-y:auto;
+                                                overscroll-behavior:contain; }
+  .hb-detail .st-row { grid-template-columns:78px 1fr; }
+  .hostbar.stale { opacity:.55; }
 </style>
 </head>
 <body>
   <h1>Unity build machine</h1>
+
+  <div id="hostBar" class="hostbar" role="button" tabindex="0" aria-expanded="false"
+       title="Build machine load — tap for details">
+    <div class="hb-row">
+      <div class="hm" id="hmCpu"><div class="hm-top"><span class="hm-l">CPU</span><span class="hm-v">–</span></div>
+        <svg viewBox="0 0 100 20" preserveAspectRatio="none"><polyline class="b"/><polyline class="m"/></svg>
+        <div class="hm-bar"><div></div></div><div class="hm-cap"></div></div>
+      <div class="hm" id="hmMem"><div class="hm-top"><span class="hm-l">MEM</span><span class="hm-v">–</span></div>
+        <svg viewBox="0 0 100 20" preserveAspectRatio="none"><polyline class="m"/></svg>
+        <div class="hm-bar"><div></div></div><div class="hm-cap"></div></div>
+      <div class="hm" id="hmDisk"><div class="hm-top"><span class="hm-l">DISK</span><span class="hm-v">–</span></div>
+        <svg viewBox="0 0 100 20" preserveAspectRatio="none"><polyline class="m"/></svg>
+        <div class="hm-bar"><div></div></div><div class="hm-cap"></div></div>
+      <span class="hb-side"><span class="hb-pill" id="hbPill">…</span>
+        <span class="hb-more" aria-hidden="true">details <span class="caret">▾</span></span></span>
+    </div>
+    <div class="hb-detail" id="hbDetail"></div>
+  </div>
 
   <div id="diskWarn" style="display:none; background:#7c2d12; color:#fed7aa;
        border-radius:10px; padding:10px 12px; margin-bottom:12px; font-size:14px"></div>
@@ -1641,6 +1692,116 @@ document.addEventListener("click", ev => {
 
 function esc(s){ return (s||"").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 loadProjects().then(() => { loadDevices(); loadProjectStatus(false); openBuildFromHash(); });
+// ---- host utilisation bar (sticky, top of page) -------------------------- //
+// CPU / memory / disk of the build machine with ~10 min sparklines. The pill
+// sums it up: how much headroom is there for another build or project?
+function fmtBytes(n){
+  if (n == null) return "?";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0;
+  while (n >= 1000 && i < u.length-1) { n /= 1000; i++; }
+  return (n >= 100 || i === 0 ? n.toFixed(0) : n.toFixed(1)) + " " + u[i];
+}
+function lvlClass(p, mid, hi){ return p == null ? "" : p >= hi ? "lvl-hi" : p >= mid ? "lvl-mid" : "lvl-ok"; }
+function sparkPoints(vals, scale){
+  const v = vals.slice(-120), n = v.length;
+  if (n < 2) return "";
+  return v.map((y, i) => y == null ? null :
+      `${(i/(n-1)*100).toFixed(1)},${(20 - Math.min(100, y*scale)/100*19 - .5).toFixed(1)}`)
+    .filter(Boolean).join(" ");
+}
+function setMeter(id, pct, label, caption, series, lv, extra){
+  const el = $(id);
+  el.className = "hm " + lv;
+  el.querySelector(".hm-v").textContent = label;
+  el.querySelector(".hm-cap").textContent = caption || "";
+  el.querySelector(".hm-bar > div").style.width = (pct == null ? 0 : Math.min(100, pct)) + "%";
+  el.querySelector("polyline.m").setAttribute("points", sparkPoints(series, 1));
+  const b = el.querySelector("polyline.b");
+  if (b) b.setAttribute("points", extra ? sparkPoints(extra.vals, extra.scale) : "");
+}
+function avgLast(vals, n){
+  const v = vals.slice(-n).filter(x => x != null);
+  return v.length ? v.reduce((a,b) => a+b, 0) / v.length : null;
+}
+async function refreshHost(){
+  if (document.hidden) return;
+  const bar = $("hostBar");
+  let h;
+  try { const r = await fetch("/api/host"); if (!r.ok) throw 0; h = await r.json(); }
+  catch(e){ bar.classList.add("stale"); bar.title = "Host stats unavailable"; return; }
+  bar.classList.remove("stale");
+  const n = h.now, s = h.series, cores = n.cores || 1;
+  const cpu = n.cpu, mem = n.mem || {}, disks = n.disks || [];
+  const fullest = disks.reduce((a, d) => (!a || (d.pct||0) > (a.pct||0)) ? d : a, null);
+  // CPU: dashed line = the build's own process tree, as a share of the whole machine.
+  const pctTxt = p => p == null ? "–" : `${Math.round(p)}%`;
+  const bshare = n.build ? `build ${Math.round(n.build.cpu / cores)}%` : (n.load ? `load ${n.load[0].toFixed(1)}/${cores}` : "");
+  setMeter("hmCpu", cpu, pctTxt(cpu), bshare, s.cpu, lvlClass(cpu, 70, 90),
+           {vals: s.build_cpu, scale: 1 / cores});
+  const swapped = mem.swap_used > 256e6;
+  setMeter("hmMem", mem.pct, pctTxt(mem.pct),
+           `${fmtBytes(mem.used)} / ${fmtBytes(mem.total)}` + (swapped ? " · swap" : ""),
+           s.mem, lvlClass(mem.pct + (swapped ? 10 : 0), 75, 90));
+  setMeter("hmDisk", fullest && fullest.pct, pctTxt(fullest && fullest.pct),
+           fullest ? `${fmtBytes(fullest.free)} free` : "",
+           s.disk, lvlClass(fullest && fullest.pct, 80, 92));
+
+  // Headroom verdict: CPU averaged over the last minute (a burst isn't "full"),
+  // memory as-is, and swapping counts as memory pressure.
+  const cpu1m = avgLast(s.cpu, Math.round(60 / (h.interval_s || 3))) ?? cpu;
+  const memScore = (mem.pct || 0) + (swapped ? 10 : 0);
+  const score = Math.max(cpu1m || 0, memScore, (fullest && fullest.pct >= 95) ? 100 : 0);
+  const pill = $("hbPill");
+  pill.className = "hb-pill " + lvlClass(score, 65, 88);
+  pill.textContent = score >= 88 ? "Saturated" : score >= 65 ? "Busy" : "Headroom";
+  pill.title = `CPU 1-min avg ${cpu1m == null ? "?" : Math.round(cpu1m) + "%"}, memory ${Math.round(mem.pct||0)}%`
+             + (swapped ? ", swapping" : "") + (h.building ? ` — building ${h.build_project}` : "")
+             + (h.queued ? `, ${h.queued} queued` : "");
+
+  // Detail panel (tap the bar).
+  const rows = [];
+  const row = (k, v) => rows.push(`<div class="st-row"><span class="k">${k}</span><span class="v">${v}</span></div>`);
+  if (n.load) row("Load", `${n.load.map(x => x.toFixed(2)).join(" / ")} <span class="subj">(1/5/15 min, ${cores} cores)</span>`);
+  row("CPU 1 min", cpu1m == null ? "?" : `${Math.round(cpu1m)}% avg`);
+  row("Memory", `${fmtBytes(mem.used)} of ${fmtBytes(mem.total)} · ${fmtBytes(mem.available)} available`);
+  if (mem.swap_total) row("Swap", `${fmtBytes(mem.swap_used)} of ${fmtBytes(mem.swap_total)}`
+                            + (swapped ? ' <span class="badge amber">swapping</span>' : ""));
+  if (n.io) row("Disk I/O", `read ${fmtBytes(n.io.read_bps)}/s · write ${fmtBytes(n.io.write_bps)}/s`);
+  if (n.build) {
+    const b = n.build;
+    row("Build", `${esc(h.build_project)}: ${Math.round(b.cpu)}% CPU (${(b.cpu/100).toFixed(1)} of ${cores} cores) · `
+        + `${fmtBytes(b.rss)} · ${b.count} procs`
+        + (b.top && b.top.length ? `<br><span class="subj">${b.top.map(t => `${esc(t.name)} ${Math.round(t.cpu)}%`).join(", ")}</span>` : ""));
+  } else if (h.building) {
+    row("Build", `${esc(h.build_project)} running` + (h.psutil ? "" : ' <span class="subj">(install psutil for per-build stats)</span>'));
+  } else {
+    row("Build", h.queued ? `${h.queued} queued` : "idle");
+  }
+  for (const d of disks)
+    row("Volume", `<span class="sha">${esc(d.path)}</span> ${Math.round(d.pct)}% · ${fmtBytes(d.free)} free of ${fmtBytes(d.total)}`);
+  if (!h.psutil) row("", '<span class="subj">psutil not installed — CPU is estimated from load average; no I/O or per-build stats.</span>');
+  $("hbDetail").innerHTML = rows.join("");
+}
+(() => {
+  // Starts collapsed (just the three meters) on every load; tap to expand.
+  // Scrolling the page folds it back up so it never sits over the content.
+  const bar = $("hostBar");
+  let openedAtY = 0;
+  const setOpen = open => {
+    bar.setAttribute("aria-expanded", String(open));
+    openedAtY = window.scrollY;
+  };
+  const toggle = () => setOpen(bar.getAttribute("aria-expanded") !== "true");
+  window.addEventListener("scroll", () => {
+    if (bar.getAttribute("aria-expanded") === "true" && Math.abs(window.scrollY - openedAtY) > 60)
+      setOpen(false);
+  }, {passive: true});
+  bar.addEventListener("click", toggle);
+  bar.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshHost(); });
+})();
+refreshHost();
+setInterval(refreshHost, 3000);
 refreshStatus();
 setInterval(refreshStatus, 4000);  // keep the page live without a reload
 setInterval(() => { if ($("picker").style.display === "none") loadDevices(); }, 15000);
