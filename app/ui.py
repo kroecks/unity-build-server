@@ -88,6 +88,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <input id="cloneUrl" type="text" placeholder="http://terronas:3000/etc/game.git">
       <label>Branch</label>
       <input id="cloneBranch" type="text" value="main">
+      <label>Platform</label>
+      <select id="clonePlatform"><option value="ios">iOS</option><option value="android">Android / Quest</option></select>
       <button class="full" id="cloneGo">Clone &amp; onboard</button>
       <small class="hint">The service clones it, detects the Unity version, and installs the build script.</small>
     </div>
@@ -98,6 +100,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div class="card" id="browseList" style="padding:0; max-height:40vh; overflow:auto"></div>
       <label>Project name</label>
       <input id="browseName" type="text" placeholder="My Game">
+      <label>Platform</label>
+      <select id="browsePlatform"><option value="ios">iOS</option><option value="android">Android / Quest</option></select>
       <button class="full" id="browseGo" disabled>Onboard this folder</button>
       <small class="hint">Folders marked ● are Unity projects.</small>
     </div>
@@ -180,11 +184,18 @@ async function loadProjects() {
   for (const p of projs) wrap.appendChild(projectCard(p));
 }
 
+const isAndroid = p => (p.platform || "ios") === "android";
+const PLATFORM_LABEL = { ios: "iOS", android: "Android / Quest" };
+
 function projectCard(p) {
   const el = document.createElement("div"); el.className = "card";
   const needs = [];
-  if (!p.development_team) needs.push("Team ID");
-  if (!p.bundle_id) needs.push("Bundle ID");
+  // Android needs no Apple bits; signing falls back to the debug keystore.
+  if (!isAndroid(p)) {
+    if (!p.development_team) needs.push("Team ID");
+    if (!p.bundle_id) needs.push("Bundle ID");
+  }
+  const platBadge = `<span class="badge">${PLATFORM_LABEL[p.platform||"ios"] || esc(p.platform)}</span>`;
   const versionBadge = p.unity_version
     ? `<span class="badge ok">${p.unity_version}</span>` : `<span class="badge warn">no version</span>`;
   const scriptBadge = p.build_script_installed
@@ -192,9 +203,11 @@ function projectCard(p) {
   el.innerHTML = `
     <div class="proj-head">
       <div class="proj-name">${esc(p.name)}</div>
-      <div>${versionBadge} ${scriptBadge}</div>
+      <div>${platBadge} ${versionBadge} ${scriptBadge}</div>
     </div>
-    <div class="meta">${esc(p.repo_url)} · ${esc(p.branch)}</div>
+    <div class="meta">${esc(p.repo_url)} · ${esc(p.branch)}${
+      isAndroid(p) ? " · " + (p.android_build_aab ? "AAB" : "APK")
+                   + (p.keystore_path ? " · release-signed" : " · debug-signed") : ""}</div>
     <div class="meta">${esc(p.local_path)}</div>
     ${needs.length ? `<div class="meta" style="color:#fbbf24">Needs: ${needs.join(", ")} — tap Edit</div>` : ""}
     <div class="btn-row">
@@ -218,12 +231,31 @@ function toggleEdit(el, p) {
   const area = el.querySelector(".editArea");
   if (area.style.display === "block") { area.style.display = "none"; return; }
   area.style.display = "block";
+  const plat = p.platform || "ios";
   area.innerHTML = `
-    <label>Apple Team ID</label><input type="text" data-f="development_team" value="${esc(p.development_team)}">
-    <label>Bundle ID</label><input type="text" data-f="bundle_id" value="${esc(p.bundle_id)}">
-    <label>Device UDID <small class="hint">(optional; blank = build only)</small></label>
+    <label>Platform <small class="hint">(one project per platform — add a second project on the same repo for the other)</small></label>
+    <select data-f="platform">
+      <option value="ios" ${plat==="ios"?"selected":""}>iOS</option>
+      <option value="android" ${plat==="android"?"selected":""}>Android / Quest</option>
+    </select>
+    <div data-only="ios">
+      <label>Apple Team ID</label><input type="text" data-f="development_team" value="${esc(p.development_team)}">
+    </div>
+    <label><span data-only="ios">Bundle ID</span><span data-only="android">Package name <small class="hint">(applicationId, e.g. com.terro.game — used to launch &amp; read logs)</small></span></label>
+    <input type="text" data-f="bundle_id" value="${esc(p.bundle_id)}">
+    <label><span data-only="ios">Device UDID</span><span data-only="android">ADB serial <small class="hint">(from <code>adb devices</code>; or ip:5555 for WiFi after <code>adb tcpip 5555</code>)</small></span>
+      <small class="hint">(optional; blank = build only)</small></label>
     <input type="text" data-f="device_udid" value="${esc(p.device_udid)}">
-    <label>Branch <small class="hint">(pushed iOS deltas must live on this branch)</small></label>
+    <div data-only="android">
+      <div class="toggle"><input type="checkbox" data-f="android_build_aab" ${p.android_build_aab?"checked":""}><label>Build AAB (Play Store) instead of APK — AABs can't be adb-installed</label></div>
+      <div class="row">
+        <div><label>Keystore path <small class="hint">(on the Mac; blank = debug key)</small></label>
+          <input type="text" data-f="keystore_path" value="${esc(p.keystore_path)}" placeholder="~/keys/game.keystore"></div>
+        <div><label>Key alias</label><input type="text" data-f="keystore_alias" value="${esc(p.keystore_alias)}"></div>
+      </div>
+      <small class="hint">Passwords are NOT stored here — put them in config.json under "android_keystores".</small>
+    </div>
+    <label>Branch <small class="hint">(pushed platform deltas must live on this branch)</small></label>
     <div class="row">
       <select data-f="branch" id="branchSel-${p.id}"><option value="${esc(p.branch)}">${esc(p.branch)}</option></select>
       <button class="sec" data-s="loadbr" style="flex:0 0 auto">↻ branches</button>
@@ -241,13 +273,13 @@ function toggleEdit(el, p) {
       <div><label>CCD bucket</label><input type="text" data-f="ccd_bucket" value="${esc(p.ccd_bucket)}"></div>
       <div><label>Addressables profile</label><input type="text" data-f="addressables_profile" value="${esc(p.addressables_profile)}" placeholder="Development"></div>
     </div>
-    <label>Remote build path <small class="hint">(where Addressables writes bundles, e.g. ServerData/iOS)</small></label>
-    <input type="text" data-f="remote_build_path" value="${esc(p.remote_build_path)}" placeholder="ServerData/iOS">
-    <label>Scripting defines <small class="hint">(semicolon-separated, e.g. TK_IOS_DEV — needed for CCD auth)</small></label>
-    <input type="text" data-f="scripting_defines" value="${esc(p.scripting_defines)}" placeholder="TK_IOS_DEV">
-    <label>Auto-merge from <small class="hint">(merge this branch into the build branch first; e.g. main → ios. Conflict aborts.)</small></label>
+    <label>Remote build path <small class="hint">(where Addressables writes bundles, e.g. ServerData/iOS or ServerData/Android)</small></label>
+    <input type="text" data-f="remote_build_path" value="${esc(p.remote_build_path)}" placeholder="${plat==="android"?"ServerData/Android":"ServerData/iOS"}">
+    <label>Scripting defines <small class="hint">(semicolon-separated, e.g. TK_IOS_DEV / TK_ANDROID_DEV / TK_QUEST_DEV — needed for CCD auth)</small></label>
+    <input type="text" data-f="scripting_defines" value="${esc(p.scripting_defines)}" placeholder="${plat==="android"?"TK_ANDROID_DEV":"TK_IOS_DEV"}">
+    <label>Auto-merge from <small class="hint">(merge this branch into the build branch first; e.g. main → ios / android. Conflict aborts.)</small></label>
     <input type="text" data-f="merge_from" value="${esc(p.merge_from)}" placeholder="main">
-    <div class="toggle"><input type="checkbox" data-f="auto_distribute" ${p.auto_distribute?"checked":""}><label>Auto-upload successful webhook builds to TestFlight</label></div>
+    <div class="toggle" data-only="ios"><input type="checkbox" data-f="auto_distribute" ${p.auto_distribute?"checked":""}><label>Auto-upload successful webhook builds to TestFlight</label></div>
 
     <label>Pre-build steps <small class="hint">(run in order before the build; first failure aborts)</small></label>
     <div id="steps-${p.id}"></div>
@@ -258,6 +290,15 @@ function toggleEdit(el, p) {
       <button class="sec" data-s="verify">Re-verify</button>
       <button class="danger" data-s="del">Remove</button>
     </div>`;
+
+  // ---- platform-specific sections: show only the selected platform's fields.
+  // Hidden fields still save (they keep their values), so switching back and
+  // forth never loses e.g. the Team ID.
+  const platSel = area.querySelector('[data-f="platform"]');
+  const applyPlat = () => area.querySelectorAll("[data-only]").forEach(n => {
+    n.style.display = n.dataset.only === platSel.value ? "" : "none";
+  });
+  platSel.onchange = applyPlat; applyPlat();
 
   // ---- pre-build steps editor ----
   const stepsWrap = area.querySelector(`#steps-${p.id}`);
@@ -352,7 +393,7 @@ function switchTab(clone) {
 }
 
 $("cloneGo").onclick = async () => {
-  const body = { name:$("cloneName").value, repo_url:$("cloneUrl").value, branch:$("cloneBranch").value || "main" };
+  const body = { name:$("cloneName").value, repo_url:$("cloneUrl").value, branch:$("cloneBranch").value || "main", platform:$("clonePlatform").value };
   if (!body.name || !body.repo_url) { alert("Name and repo URL required"); return; }
   $("cloneGo").disabled = true; $("cloneGo").textContent = "Cloning…";
   try { await api("POST","/api/projects/clone", body); $("addPanel").style.display="none"; await loadProjects(); }
@@ -387,7 +428,7 @@ async function browse(path) {
 }
 $("browseGo").onclick = async () => {
   if (!browseSelected) return;
-  const body = { name: $("browseName").value, local_path: browseSelected };
+  const body = { name: $("browseName").value, local_path: browseSelected, platform: $("browsePlatform").value };
   if (!body.name) { alert("Project name required"); return; }
   try { await api("POST","/api/projects/adopt", body); $("addPanel").style.display="none"; await loadProjects(); }
   catch(e){ alert("Onboard failed: " + e.message); }
@@ -550,7 +591,7 @@ async function loadFullLog() {
 }
 $("stopBuild").onclick = async () => {
   if (!currentBuildId) return;
-  if (!confirm("Stop this build? Unity and Xcode will be terminated.")) return;
+  if (!confirm("Stop this build? Unity (and Xcode/adb) will be terminated.")) return;
   $("stopBuild").disabled = true;
   try { await api("POST", `/cancel/${currentBuildId}`); setState("cancelling"); }
   catch(e){ alert("Stop failed: " + e.message); }
@@ -670,8 +711,15 @@ function allBuildRow(b) {
     <div class="row" style="margin-top:8px;gap:6px">
       ${b.has_artifact ? `<a href="${b.artifact_url}"><button class="sec">⤓ Download</button></a>` : ""}
       <button class="sec" data-a="install">📲 Install</button>
-      <button class="sec" data-a="distribute">🚀 Distribute</button>
+      ${b.platform === "android" ? "" : '<button class="sec" data-a="distribute">🚀 Distribute</button>'}
+      <button class="sec" data-a="tag" title="Name / tag this build">🏷 Tag</button>
     </div>` : "";
+  // Version + commit line (only when we have them). version_label is "1.4.2 (57)".
+  const idbits = [];
+  if (b.version_label) idbits.push(`<b style="color:#cbd5e1">${esc(b.version_label)}</b>`);
+  if (b.commit_short) idbits.push(`<span style="color:#93c5fd">${esc(b.commit_short)}</span>`);
+  const idline = idbits.length ? `<div class="meta">${idbits.join(" · ")}</div>` : "";
+  const labelline = b.label ? `<div class="meta" style="color:#fbbf24">🏷 ${esc(b.label)}</div>` : "";
   el.innerHTML = `
     <div class="proj-head">
       <div style="display:flex;align-items:center;gap:8px">
@@ -681,6 +729,7 @@ function allBuildRow(b) {
       </div>
       <span class="badge">${esc(b.source)}</span>
     </div>
+    ${idline}${labelline}
     <div class="meta">${when}${dur} · ${esc(b.state)}${rc}</div>${actions}`;
   if (selectModeOn) {
     const cb = el.querySelector(".selbox");
@@ -701,12 +750,21 @@ function allBuildRow(b) {
         finally { inst.disabled = false; inst.textContent = "📲 Install"; }
       };
       const dist = el.querySelector('[data-a="distribute"]');
-      dist.onclick = async (ev) => { ev.stopPropagation();
+      if (dist) dist.onclick = async (ev) => { ev.stopPropagation();
         if (!confirm("Upload this build to TestFlight / App Store Connect?")) return;
         dist.disabled = true; dist.textContent = "Uploading…";
         try { await api("POST", `/build/${b.project_id}/distribute/${b.id}`); refreshStatus(); }
         catch(e){ alert("Distribute failed: " + e.message); }
         finally { dist.disabled = false; dist.textContent = "🚀 Distribute"; }
+      };
+      const tag = el.querySelector('[data-a="tag"]');
+      if (tag) tag.onclick = async (ev) => { ev.stopPropagation();
+        const name = prompt("Name / tag for this build:", b.label || "");
+        if (name === null) return;   // cancelled
+        try {
+          await api("PATCH", `/api/builds/${b.id}`, { label: name });
+          b.label = name; renderAllBuilds();
+        } catch(e){ alert("Couldn't save tag: " + e.message); }
       };
       // The download link shouldn't bubble up to the row's viewLog handler either.
       const dl = el.querySelector("a");
@@ -808,7 +866,7 @@ function historyRow(b, active) {
       <span>
         ${b.has_artifact ? `<a href="${b.artifact_url}"><button class="sec">⤓ Download</button></a>
           <button class="sec" data-a="install">📲 Install</button>
-          <button class="sec" data-a="distribute">🚀 Distribute</button>` : ""}
+          ${b.platform === "android" ? "" : '<button class="sec" data-a="distribute">🚀 Distribute</button>'}` : ""}
         <button class="danger" data-a="del">✕</button>
       </span>
     </div>` : ""}`;

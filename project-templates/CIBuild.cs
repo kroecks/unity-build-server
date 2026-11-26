@@ -47,7 +47,8 @@ namespace VoxelMage.EditorTools
 
         /// <summary>
         /// Pre-build step 0: apply scripting defines from UBS_SCRIPTING_DEFINES
-        /// (set per-project in the build UI) to the iOS target. This MUST run as
+        /// (set per-project in the build UI) to the target being built
+        /// (UBS_PLATFORM: iOS or Android). This MUST run as
         /// its OWN batchmode step, before the blob/Addressables/player steps,
         /// because changing defines triggers a recompile — the new code (e.g. the
         /// CCD auth header behind #if TK_IOS_DEV) is only active on the NEXT
@@ -66,7 +67,14 @@ namespace VoxelMage.EditorTools
                     if (t.Length > 0) wanted.Add(t);
                 }
 
-                var target = NamedBuildTarget.iOS;
+                // Apply to the platform being built. This used to be hardcoded to
+                // iOS, which would silently leave Android builds without their
+                // auth define (→ CCD 401s). UBS_PLATFORM is set by the server;
+                // fall back to the active target (= -buildTarget) when run by hand.
+                var plat = (Environment.GetEnvironmentVariable("UBS_PLATFORM") ?? "").Trim().ToLowerInvariant();
+                var target = plat == "android" ? NamedBuildTarget.Android
+                           : plat == "ios"     ? NamedBuildTarget.iOS
+                           : NamedBuildTarget.FromBuildTargetGroup(EditorUserBuildSettings.selectedBuildTargetGroup);
                 var current = PlayerSettings.GetScriptingDefineSymbols(target)
                     .Split(';', StringSplitOptions.RemoveEmptyEntries);
 
@@ -80,7 +88,7 @@ namespace VoxelMage.EditorTools
 
                 var joined = string.Join(";", result);
                 PlayerSettings.SetScriptingDefineSymbols(target, joined);
-                Debug.Log($"[CIBuild] iOS scripting defines set to: {joined}");
+                Debug.Log($"[CIBuild] {target.TargetName} scripting defines set to: {joined}");
                 // Persist so the recompile on next launch picks it up.
                 AssetDatabase.SaveAssets();
             }

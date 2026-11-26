@@ -45,10 +45,23 @@ class Project:
     branch: str = "main"
     local_path: str = ""                # where it's cloned on the mini
     unity_version: str = ""             # auto-detected from ProjectVersion.txt
+    # Build target. "ios" (default, so existing records are unchanged) or
+    # "android" (also Quest — an Android APK with Meta's runtime). One project
+    # per platform: an android project is a separate record on the same repo,
+    # building the `android` branch with merge_from: main.
+    platform: str = "ios"               # "ios" | "android"
     # Apple bits — the only things a human provides, once, via the form:
-    development_team: str = ""          # 10-char Apple Team ID
-    bundle_id: str = ""
-    device_udid: str = ""               # target iPhone, optional
+    development_team: str = ""          # 10-char Apple Team ID (iOS only)
+    bundle_id: str = ""                 # iOS bundle id / Android package name
+    device_udid: str = ""               # iOS: target iPhone UDID. Android: adb
+                                        # serial (`adb devices`), or host:port for
+                                        # ADB-over-WiFi. Optional; blank = build only.
+    # Android-only. Keystore path + alias live here; the PASSWORDS do not — they
+    # come from host config (config.json "android_keystores"), like the ASC key.
+    # Blank keystore_path = Unity's debug keystore (fine for sideloading/Quest dev).
+    android_build_aab: bool = False     # True = .aab (Play Store), False = .apk (adb / Quest)
+    keystore_path: str = ""             # absolute path on the mini, e.g. ~/keys/game.keystore
+    keystore_alias: str = ""
     # behaviour
     webhook_deploys: bool = False       # does a git push also install to phone?
     reclaim_disk: bool = True           # uninstall other editor versions when installing
@@ -71,6 +84,9 @@ class Project:
                                         # build and leaves the branch untouched. Empty = off.
     auto_distribute: bool = False       # upload successful webhook builds to TestFlight
                                         # automatically (uses shared ASC key in config)
+    next_build_number: int = 1          # monotonic build number the server injects +
+                                        # increments each build, so stores never reject
+                                        # a duplicate (iOS buildNumber / Android bundleVersionCode)
     # Optional ordered pre-build steps (blob build, CCD upload, …) — see above.
     pre_build_steps: list = field(default_factory=list)
 
@@ -144,15 +160,22 @@ class Registry:
         r = self._read().get(project_id)
         return Project.from_record(r) if r else None
 
+    @staticmethod
+    def _norm_url(u: str) -> str:
+        return (u or "").rstrip("/").removesuffix(".git").lower()
+
     def get_by_repo(self, repo_url: str) -> Optional[Project]:
-        """Match a webhook's repo URL to a project. Normalizes trailing .git and slashes."""
-        def norm(u: str) -> str:
-            return u.rstrip("/").removesuffix(".git").lower()
-        target = norm(repo_url)
-        for r in self._read().values():
-            if norm(r["repo_url"]) == target:
-                return Project.from_record(r)
-        return None
+        """First project matching a repo URL. Normalizes trailing .git and slashes.
+        Prefer list_by_repo for webhooks: one repo can now back several projects
+        (e.g. an ios project and an android project)."""
+        hits = self.list_by_repo(repo_url)
+        return hits[0] if hits else None
+
+    def list_by_repo(self, repo_url: str) -> "list[Project]":
+        """Every project whose repo URL matches (ios + android on the same repo)."""
+        target = self._norm_url(repo_url)
+        return [Project.from_record(r) for r in self._read().values()
+                if self._norm_url(r.get("repo_url", "")) == target]
 
     def add(self, project: Project) -> Project:
         with self._lock:
@@ -169,6 +192,20 @@ class Registry:
             data[project_id].update(fields)
             self._write(data)
             return Project.from_record(data[project_id])
+
+    def claim_build_number(self, project_id: str) -> int:
+        """Atomically return this project's next build number and increment the
+        stored counter, so each build gets a unique, monotonically-increasing
+        number (stores reject duplicates). Under the lock so two builds can't
+        claim the same one."""
+        with self._lock:
+            data = self._read()
+            if project_id not in data:
+                return 0
+            n = int(data[project_id].get("next_build_number", 1) or 1)
+            data[project_id]["next_build_number"] = n + 1
+            self._write(data)
+            return n
 
     def remove(self, project_id: str) -> bool:
         with self._lock:

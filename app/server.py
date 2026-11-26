@@ -82,6 +82,58 @@ ASC_KEY_ID = CFG.get("asc_key_id", "")
 ASC_ISSUER_ID = CFG.get("asc_issuer_id", "")
 ASC_KEY_PATH = str(Path(CFG["asc_key_path"]).expanduser()) if CFG.get("asc_key_path") else ""
 
+# Android keystore PASSWORDS (host-level secrets, like the ASC key — never in the
+# registry or the UI). Keyed by keystore path as entered on the project; a
+# "default" entry applies to any keystore without its own entry:
+#   "android_keystores": {
+#     "~/keys/voxelmage.keystore": {"store_pass": "...", "key_pass": "..."},
+#     "default":                   {"store_pass": "...", "key_pass": "..."}
+#   }
+# key_pass defaults to store_pass if omitted (common for single-key keystores).
+ANDROID_KEYSTORES = CFG.get("android_keystores", {}) or {}
+
+# adb: explicit config path, else PATH (brew android-platform-tools), else the
+# SDK bundled with any Hub-installed editor's Android module.
+ADB_CFG = str(Path(CFG["adb_path"]).expanduser()) if CFG.get("adb_path") else ""
+
+PLATFORMS = {
+    # platform -> (Unity -buildTarget, BuildScript entry point)
+    "ios": ("iOS", "BuildScript.PerformiOSBuild"),
+    "android": ("Android", "BuildScript.PerformAndroidBuild"),
+}
+
+
+def _keystore_passwords(keystore_path: str) -> tuple[str, str]:
+    """(store_pass, key_pass) for a keystore from host config. Matches on the
+    path as typed or expanded; falls back to the "default" entry."""
+    if not keystore_path:
+        return "", ""
+    exp = str(Path(keystore_path).expanduser())
+    ent = None
+    for k, v in ANDROID_KEYSTORES.items():
+        if k == "default":
+            continue
+        if k == keystore_path or str(Path(k).expanduser()) == exp:
+            ent = v; break
+    if ent is None:
+        ent = ANDROID_KEYSTORES.get("default") or {}
+    store = str(ent.get("store_pass", "") or "")
+    key = str(ent.get("key_pass", "") or store)
+    return store, key
+
+
+def _adb_path() -> str:
+    if ADB_CFG and Path(ADB_CFG).exists():
+        return ADB_CFG
+    w = shutil.which("adb", path="/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", ""))
+    if w:
+        return w
+    for root in (Path.home() / "Applications/Unity/Hub/Editor", Path("/Applications/Unity/Hub/Editor")):
+        hits = sorted(root.glob("*/PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb"), reverse=True)
+        if hits:
+            return str(hits[0])
+    return "adb"   # let it fail with a clear "command not found"
+
 reg = Registry(REGISTRY_PATH)
 app = FastAPI(title="Unity Build Server")
 
@@ -112,6 +164,11 @@ class Build:
     returncode: Optional[int] = None
     output_dir: str = ""
     artifact: str = ""          # path to the final .ipa/.app/archive, if produced
+    version: str = ""           # Unity bundleVersion, e.g. "1.4.2"
+    build_number: str = ""      # the (auto-incremented) build number, e.g. "57"
+    commit_sha: str = ""        # the git commit this build came from (short)
+    label: str = ""             # user-assigned name/tag for this build
+    platform: str = "ios"       # project platform at enqueue time (UI hides iOS-only actions)
 
     def duration(self) -> Optional[float]:
         if self.started_at is None:
@@ -132,6 +189,16 @@ class Build:
         d["elapsed"] = self.duration()                      # seconds, live if running
         d["has_artifact"] = bool(self.artifact and Path(self.artifact).exists())
         d["artifact_url"] = f"/artifact/{self.id}" if d["has_artifact"] else ""
+        # Human-friendly version label, e.g. "1.4.2 (57)". Empty if unknown.
+        if self.version and self.build_number:
+            d["version_label"] = f"{self.version} ({self.build_number})"
+        elif self.version:
+            d["version_label"] = self.version
+        elif self.build_number:
+            d["version_label"] = f"build {self.build_number}"
+        else:
+            d["version_label"] = ""
+        d["commit_short"] = (self.commit_sha or "")[:8]
         return d
 
 
@@ -151,7 +218,9 @@ def save_history() -> None:
                  "source": b.source, "deploy": b.deploy, "state": b.state,
                  "created_at": b.created_at, "started_at": b.started_at,
                  "finished_at": b.finished_at, "returncode": b.returncode,
-                 "output_dir": b.output_dir, "artifact": b.artifact}
+                 "output_dir": b.output_dir, "artifact": b.artifact,
+                 "version": b.version, "build_number": b.build_number,
+                 "commit_sha": b.commit_sha, "label": b.label, "platform": b.platform}
                 for b in list(HISTORY)]
         tmp = HISTORY_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2))
@@ -171,7 +240,8 @@ def load_history() -> None:
             HISTORY.append(Build(**{k: rec[k] for k in
                 ("id", "project_id", "project_name", "source", "deploy",
                  "state", "created_at", "started_at", "finished_at",
-                 "returncode", "output_dir", "artifact")
+                 "returncode", "output_dir", "artifact",
+                 "version", "build_number", "commit_sha", "label", "platform")
                 if k in rec}))
     except Exception:
         pass
@@ -198,13 +268,37 @@ async def run_build(build: Build, project: Project) -> None:
     build.output_dir = str(out_dir)
     # Only the enabled pre-build steps, in order, as JSON for the build script.
     steps = [s for s in project.pre_build_steps if s.get("enabled", True)]
+    # Claim a monotonic build number for a REAL build (not install/distribute,
+    # which reuse an existing artifact's number). The build script injects this
+    # into PlayerSettings (iOS buildNumber / Android bundleVersionCode) before
+    # the player build, so stores never see a duplicate.
+    is_real_build = build.source not in ("install", "distribute")
+    if is_real_build:
+        bn = reg.claim_build_number(project.id)
+        build.build_number = str(bn) if bn else ""
+    platform = project.platform if project.platform in PLATFORMS else "ios"
+    build_target, build_method = PLATFORMS[platform]
+    store_pass, key_pass = (_keystore_passwords(project.keystore_path)
+                            if platform == "android" else ("", ""))
     # Per-project parameters passed via env, never shell interpolation.
     env.update({
         "UBS_BUILD_ID": build.id,
         "UBS_PROJECT_DIR": project.local_path,
         "UBS_BRANCH": project.branch,
         "UBS_DEPLOY": "1" if build.deploy else "0",
-        "UBS_BUILD_METHOD": "BuildScript.PerformiOSBuild",
+        # Platform-derived: build.sh passes UBS_BUILD_TARGET to every Unity
+        # launch (pre-build steps included) and branches its post-Unity stage on
+        # UBS_PLATFORM. CIBuild.SetScriptingDefines also reads UBS_PLATFORM.
+        "UBS_PLATFORM": platform,
+        "UBS_BUILD_TARGET": build_target,
+        "UBS_BUILD_METHOD": build_method,
+        # Android signing/output. Passwords come from host config, not the registry.
+        "UBS_ANDROID_AAB": "1" if project.android_build_aab else "0",
+        "UBS_KEYSTORE_PATH": str(Path(project.keystore_path).expanduser()) if project.keystore_path else "",
+        "UBS_KEYSTORE_ALIAS": project.keystore_alias,
+        "UBS_KEYSTORE_PASS": store_pass,
+        "UBS_KEY_ALIAS_PASS": key_pass,
+        "UBS_ADB": _adb_path() if platform == "android" else "",
         "UBS_DEVELOPMENT_TEAM": project.development_team,
         "UBS_BUNDLE_ID": project.bundle_id,
         "UBS_DEVICE_UDID": project.device_udid,
@@ -222,6 +316,8 @@ async def run_build(build: Build, project: Project) -> None:
         "UBS_REMOTE_BUILD_PATH": project.remote_build_path,
         "UBS_SCRIPTING_DEFINES": project.scripting_defines,
         "UBS_MERGE_FROM": project.merge_from,
+        # Build number to stamp into PlayerSettings (empty for install/distribute).
+        "UBS_BUILD_NUMBER": build.build_number,
         # Install-only run (from the UI "Install" button): push an existing
         # artifact to the phone without rebuilding.
         "UBS_INSTALL_ONLY": "1" if build.source == "install" else "0",
@@ -277,8 +373,22 @@ async def run_build(build: Build, project: Project) -> None:
     if dur is not None:
         with open(build.log_path, "a") as lf:
             lf.write(f"=== duration: {dur:.0f}s ===\n")
-    # Find the artifact the build produced (ipa preferred, else app, else archive).
-    build.artifact = _find_artifact(Path(build.output_dir)) if build.output_dir else ""
+    # Find the artifact the build produced (ipa > archive > app on iOS; apk > aab on Android).
+    build.artifact = _find_artifact(Path(build.output_dir), platform) if build.output_dir else ""
+    # Read back version/commit the build script recorded (build-info.json in the
+    # output dir). Best-effort: absence just leaves the fields blank.
+    if build.output_dir:
+        info_path = Path(build.output_dir) / "build-info.json"
+        try:
+            if info_path.exists():
+                info = json.loads(info_path.read_text())
+                build.version = str(info.get("version", "") or build.version)
+                # The script echoes back the applied build number; trust it over
+                # our claimed one if present (they should match).
+                build.build_number = str(info.get("build_number", "") or build.build_number)
+                build.commit_sha = str(info.get("commit_sha", "") or build.commit_sha)
+        except Exception:
+            pass
     HISTORY.appendleft(build)
     save_history()
     prune_outputs(build.project_id)
@@ -286,7 +396,7 @@ async def run_build(build: Build, project: Project) -> None:
     # Auto-distribute: a successful webhook build of a project that opted in gets
     # queued for TestFlight upload (only if ASC is configured). Never auto-distribute
     # install/distribute runs themselves, or manual/failed builds.
-    if (build.state == "success" and build.source == "gitea"
+    if (build.state == "success" and build.source == "gitea" and platform == "ios"
             and project.auto_distribute and ASC_KEY_ID and ASC_ISSUER_ID and ASC_KEY_PATH):
         archive = _find_archive(build)
         if archive:
@@ -295,10 +405,19 @@ async def run_build(build: Build, project: Project) -> None:
                 nb.artifact = archive
 
 
-def _find_artifact(out_dir: Path) -> str:
+_ARTIFACT_PATTERNS = {
+    "ios": ("**/*.ipa", "**/*.xcarchive", "**/Release-iphoneos/*.app"),
+    # Unity writes the APK/AAB directly — no second toolchain. Only look in the
+    # android/ subdir so stray .apk files elsewhere (e.g. inside an embedded SDK
+    # cache) can't be mistaken for the build output.
+    "android": ("android/*.apk", "android/*.aab"),
+}
+
+
+def _find_artifact(out_dir: Path, platform: str = "ios") -> str:
     if not out_dir.exists():
         return ""
-    for pattern in ("**/*.ipa", "**/*.xcarchive", "**/Release-iphoneos/*.app"):
+    for pattern in _ARTIFACT_PATTERNS.get(platform, _ARTIFACT_PATTERNS["ios"]):
         hits = sorted(out_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
         if hits:
             return str(hits[0])
@@ -380,7 +499,8 @@ def enqueue(project: Project, source: str, deploy: bool, coalesce: bool = False)
             if q.project_id == project.id:
                 return None   # already a pending build for this project
     b = Build(id=uuid.uuid4().hex[:12], project_id=project.id,
-              project_name=project.name, source=source, deploy=deploy)
+              project_name=project.name, source=source, deploy=deploy,
+              platform=project.platform or "ios")
     QUEUE.append(b); _wakeup.set()
     return b
 
@@ -419,11 +539,21 @@ async def api_clone(request: Request, x_build_token: str = Header(default="")):
     branch = (body.get("branch") or "main").strip()
     if not name or not repo_url:
         raise HTTPException(status_code=400, detail="name and repo_url required")
+    platform = _check_platform(body.get("platform") or "ios")
     try:
         proj = onboarding.onboard_from_clone(reg, BUILDS_ROOT, name, repo_url, branch)
     except onboarding.OnboardError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    if platform != proj.platform:
+        proj = reg.update(proj.id, platform=platform)
     return proj.public()
+
+
+def _check_platform(p: str) -> str:
+    p = (p or "").strip().lower()
+    if p not in PLATFORMS:
+        raise HTTPException(status_code=400, detail=f"platform must be one of {sorted(PLATFORMS)}")
+    return p
 
 
 @app.post("/api/projects/adopt")
@@ -438,10 +568,13 @@ async def api_adopt(request: Request, x_build_token: str = Header(default="")):
     rp = Path(local_path).resolve()
     if not str(rp).startswith(str(BROWSE_ROOT.resolve())):
         raise HTTPException(status_code=400, detail="path outside the allowed root")
+    platform = _check_platform(body.get("platform") or "ios")
     try:
         proj = onboarding.onboard_from_path(reg, name, str(rp))
     except onboarding.OnboardError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    if platform != proj.platform:
+        proj = reg.update(proj.id, platform=platform)
     return proj.public()
 
 
@@ -453,8 +586,11 @@ async def api_edit(project_id: str, request: Request, x_build_token: str = Heade
                "webhook_deploys", "reclaim_disk", "clean_ignored", "pre_build_steps",
                "ccd_project_id", "ccd_environment", "ccd_bucket",
                "addressables_profile", "remote_build_path", "scripting_defines",
-               "merge_from", "auto_distribute"}
+               "merge_from", "auto_distribute",
+               "platform", "android_build_aab", "keystore_path", "keystore_alias"}
     fields = {k: v for k, v in body.items() if k in allowed}
+    if "platform" in fields:
+        fields["platform"] = _check_platform(fields["platform"])
     proj = reg.update(project_id, **fields)
     if not proj:
         raise HTTPException(status_code=404, detail="no such project")
@@ -616,9 +752,19 @@ async def gitea_webhook(request: Request, x_gitea_signature: str = Header(defaul
     ref = payload.get("ref", "")
     branch = ref.rsplit("/", 1)[-1] if ref else ""
 
-    proj = reg.get_by_repo(repo_url)
-    if not proj:
+    # One repo can back several projects (ios + android on their own branches,
+    # both merging from main), so a push fans out to EVERY matching project
+    # whose trigger branch it hit. They queue and run one after another.
+    projs = reg.list_by_repo(repo_url)
+    if not projs:
         return JSONResponse({"skipped": True, "reason": f"no project matches {repo_url}"})
+    results = [_webhook_for_project(p, branch) for p in projs]
+    if len(results) == 1:
+        return JSONResponse(results[0])
+    return JSONResponse({"projects": results})
+
+
+def _webhook_for_project(proj: Project, branch: str) -> dict:
     # Decide which branch pushes trigger a build:
     #  - If merge_from is set (e.g. ios merges main), the TRIGGER is the merge_from
     #    branch (main). We deliberately do NOT trigger on pushes to the build
@@ -632,16 +778,16 @@ async def gitea_webhook(request: Request, x_gitea_signature: str = Header(defaul
     else:
         triggers = {proj.branch}
     if branch and branch not in triggers:
-        return JSONResponse({"skipped": True,
-                             "reason": f"push to '{branch}', this project builds on "
-                                       + ("/".join(sorted(triggers)))})
+        return {"project": proj.name, "skipped": True,
+                "reason": f"push to '{branch}', this project builds on "
+                          + ("/".join(sorted(triggers)))}
     # Coalesce rapid pushes: don't stack redundant builds for the same project.
     b = enqueue(proj, "gitea", proj.webhook_deploys, coalesce=True)
     if b is None:
-        return JSONResponse({"coalesced": True,
-                             "reason": "a build for this project is already queued; "
-                                       "it will pick up the latest commits"})
-    return JSONResponse(b.public())
+        return {"project": proj.name, "coalesced": True,
+                "reason": "a build for this project is already queued; "
+                          "it will pick up the latest commits"}
+    return b.public()
 
 
 def _disk_free_gb(path: Path) -> Optional[float]:
@@ -790,14 +936,176 @@ async def logs_stream(build_id: str):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+# --------------------------------------------------------------------------- #
+# Android device logs (adb logcat). Same three UI buttons as iOS:
+#   live (relaunch + stream), last run (dump the ring buffer, no relaunch), zip.
+# --------------------------------------------------------------------------- #
+
+# Unity's Debug.Log goes to the "Unity" tag; Java crashes to AndroidRuntime;
+# native crashes (IL2CPP) to DEBUG/libc/CRASH. Everything else silenced.
+_LOGCAT_FILTER = ["Unity:V", "AndroidRuntime:E", "DEBUG:V", "libc:E", "CRASH:V",
+                  "ActivityManager:W", "*:S"]
+
+
+def _adb_cmd(serial: str, *args: str) -> list[str]:
+    return [_adb_path(), "-s", serial, *args]
+
+
+async def _adb_connect_if_wifi(serial: str) -> str:
+    """ADB-over-WiFi: a serial of host:port needs `adb connect` first (after a
+    one-time `adb tcpip 5555` over USB). No-op for USB serials."""
+    if ":" not in serial:
+        return ""
+    _rc, out = await _run_capture([_adb_path(), "connect", serial], timeout=15)
+    return out
+
+
+async def _sse_proc(cmd: list[str], cap_s: int = 0):
+    """Run cmd, yield its output as SSE data lines (chunked, long-line safe).
+    cap_s > 0 stops after that many seconds (for endless streams like logcat)."""
+    yield f"data: $ {' '.join(cmd)}\n\n"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True, limit=1024 * 1024)
+    except FileNotFoundError:
+        yield f"data: (command not found: {cmd[0]} — install android-platform-tools "\
+              "or set adb_path in config.json)\n\n"
+        return
+    start = time.time()
+    buf = b""
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(proc.stdout.read(16384), timeout=5)
+            except asyncio.TimeoutError:
+                chunk = None
+            if chunk == b"":
+                break
+            if chunk:
+                buf += chunk
+                while b"\n" in buf:
+                    one, buf = buf.split(b"\n", 1)
+                    yield f"data: {one.decode(errors='replace').rstrip(chr(13))}\n\n"
+            if cap_s and time.time() - start > cap_s:
+                yield f"data: --- stopped after {cap_s // 60} min; tap again to resume ---\n\n"
+                break
+        if buf:
+            yield f"data: {buf.decode(errors='replace')}\n\n"
+    finally:
+        if proc.returncode is None:
+            try: os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception: pass
+
+
+def _android_device_logs(proj: Project):
+    serial, pkg = proj.device_udid, proj.bundle_id
+
+    async def gen():
+        note = await _adb_connect_if_wifi(serial)
+        if note:
+            yield f"data: {note.strip()}\n\n"
+        # Clear the ring buffer so the stream starts at THIS launch.
+        await _run_capture(_adb_cmd(serial, "logcat", "-c"), timeout=15)
+        if pkg:
+            yield f"data: launching {pkg}…\n\n"
+            # force-stop first so this is a fresh process (matches iOS relaunch).
+            await _run_capture(_adb_cmd(serial, "shell", "am", "force-stop", pkg), timeout=15)
+            _rc, out = await _run_capture(_adb_cmd(
+                serial, "shell", "monkey", "-p", pkg, "-c",
+                "android.intent.category.LAUNCHER", "1"), timeout=20)
+            if "No activities found" in out or "monkey aborted" in out:
+                yield f"data: (could not launch {pkg} — is it installed? {out.strip()})\n\n"
+        else:
+            yield "data: (no package name set — streaming without relaunch)\n\n"
+        async for line in _sse_proc(_adb_cmd(serial, "logcat", "-v", "time", *_LOGCAT_FILTER),
+                                    cap_s=180):
+            yield line
+        yield "event: done\ndata: done\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+def _android_last_logs(proj: Project):
+    serial = proj.device_udid
+
+    async def gen():
+        yield "data: === Last-run logs from the device ring buffer (no relaunch) ===\n\n"
+        note = await _adb_connect_if_wifi(serial)
+        if note:
+            yield f"data: {note.strip()}\n\n"
+        yield "data: \n\n"
+        yield "data: --- Unity + crash tags (logcat -d) ---\n\n"
+        async for line in _sse_proc(_adb_cmd(serial, "logcat", "-d", "-v", "time", *_LOGCAT_FILTER)):
+            yield line
+        yield "data: \n\n"
+        yield "data: --- crash buffer (logcat -b crash) ---\n\n"
+        async for line in _sse_proc(_adb_cmd(serial, "logcat", "-d", "-b", "crash", "-v", "time")):
+            yield line
+        yield "data: \n\n"
+        yield "data: (logcat is a rolling buffer — a long session after the failure "\
+              "can push it out. Use ⤓ Logs zip for the full buffer.)\n\n"
+        yield "event: done\ndata: done\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+async def _android_logs_zip(proj: Project):
+    import tempfile, zipfile
+    serial, pkg = proj.device_udid, proj.bundle_id
+    work = tempfile.mkdtemp(prefix="logzip-")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    manifest = [f"Unity build server — Android log bundle",
+                f"project: {proj.name}  ({proj.id})", f"device:  {serial}",
+                f"app:     {pkg}", f"created: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}", ""]
+    try:
+        zippath = os.path.join(work, f"devicelogs-{proj.id}-{stamp}.zip")
+        with zipfile.ZipFile(zippath, "w", zipfile.ZIP_DEFLATED) as zf:
+            note = await _adb_connect_if_wifi(serial)
+            if note:
+                zf.writestr("commands/adb-connect.txt", note)
+            for name, args in (("logcat-unity.txt", ["logcat", "-d", "-v", "time", *_LOGCAT_FILTER]),
+                               ("logcat-all.txt", ["logcat", "-d", "-v", "threadtime"]),
+                               ("logcat-crash.txt", ["logcat", "-d", "-b", "crash", "-v", "time"])):
+                rc, out = await _run_capture(_adb_cmd(serial, *args), timeout=120)
+                zf.writestr(name, out)
+                manifest.append(f"{name}: {'ok' if rc == 0 else f'rc={rc}'}")
+            # App-written logs under persistentDataPath (/sdcard/Android/data/<pkg>/files).
+            if pkg:
+                dest = os.path.join(work, "appdata")
+                os.makedirs(dest, exist_ok=True)
+                rc, out = await _run_capture(_adb_cmd(
+                    serial, "pull", f"/sdcard/Android/data/{pkg}/files", dest), timeout=180)
+                zf.writestr("commands/appdata-pull.txt", out)
+                added = 0
+                for root_, _d, files in os.walk(dest):
+                    for fn in files:
+                        low = fn.lower()
+                        if low.endswith((".log", ".txt")) or "log" in low:
+                            fp = os.path.join(root_, fn)
+                            zf.write(fp, os.path.join("app-logs", os.path.relpath(fp, dest)))
+                            added += 1
+                manifest.append(f"app-logs: {added} file(s) from persistentDataPath")
+            zf.writestr("manifest.txt", "\n".join(manifest) + "\n")
+        out_zip = os.path.join(tempfile.gettempdir(), os.path.basename(zippath))
+        shutil.move(zippath, out_zip)
+        return FileResponse(out_zip, filename=os.path.basename(out_zip),
+                            media_type="application/zip")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 @app.get("/device-logs/{project_id}")
 async def device_logs(project_id: str):
     """Stream the device console (xcrun devicectl) for a project's target device,
     so the app's runtime output (addressables errors, exceptions) is visible in
-    the UI. Filtered to the app's process when possible. SSE, like build logs."""
+    the UI. Filtered to the app's process when possible. SSE, like build logs.
+    Android projects stream adb logcat instead."""
     proj = reg.get(project_id)
     if not proj or not proj.device_udid:
         raise HTTPException(status_code=404, detail="no project or no device UDID set")
+    if proj.platform == "android":
+        return _android_device_logs(proj)
 
     if not proj.bundle_id:
         raise HTTPException(status_code=400, detail="project has no bundle id to launch")
@@ -890,6 +1198,8 @@ async def device_logs_zip(project_id: str, minutes: int = 30):
     proj = reg.get(project_id)
     if not proj or not proj.device_udid:
         raise HTTPException(status_code=404, detail="no project or no device UDID set")
+    if proj.platform == "android":
+        return await _android_logs_zip(proj)
     udid = proj.device_udid
     proc_name = (getattr(proj, "device_process_name", "") or "").strip()
     if not proc_name and proj.bundle_id:
@@ -1022,6 +1332,8 @@ async def device_logs_last(project_id: str, minutes: int = 10):
     proj = reg.get(project_id)
     if not proj or not proj.device_udid:
         raise HTTPException(status_code=404, detail="no project or no device UDID set")
+    if proj.platform == "android":
+        return _android_last_logs(proj)
 
     udid = proj.device_udid
     # Unity's player process name is the product name, not the bundle id. Default
@@ -1294,6 +1606,10 @@ async def distribute_build(project_id: str, build_id: str, x_build_token: str = 
     b = find_build(build_id)
     if not proj or not b:
         raise HTTPException(status_code=404, detail="no such project/build")
+    if (b.platform or proj.platform) == "android":
+        raise HTTPException(status_code=400, detail="Distribute is TestFlight-only for now. "
+                            "For Android, download the APK/AAB and sideload it, upload it to "
+                            "Play Console, or push it to a Quest release channel.")
     if not (ASC_KEY_ID and ASC_ISSUER_ID and ASC_KEY_PATH):
         raise HTTPException(status_code=400, detail="App Store Connect key not configured "
                             "(set asc_key_id / asc_issuer_id / asc_key_path in config.json)")
@@ -1333,6 +1649,19 @@ async def list_builds(offset: int = 0, limit: int = 20, project_id: str = ""):
     page = items[offset: offset + max(1, min(limit, 200))]
     return {"total": total, "offset": offset, "limit": limit,
             "builds": [b.public() for b in page]}
+
+
+@app.patch("/api/builds/{build_id}")
+async def label_build(build_id: str, request: Request, x_build_token: str = Header(default="")):
+    """Set a user-assigned label/tag on a build (e.g. 'demo for Dan', 'good RC')."""
+    _check_token(x_build_token)
+    b = find_build(build_id)
+    if not b:
+        raise HTTPException(status_code=404, detail="no such build")
+    body = await request.json()
+    b.label = str(body.get("label", ""))[:120]
+    save_history()
+    return b.public()
 
 
 @app.delete("/api/builds/{build_id}")

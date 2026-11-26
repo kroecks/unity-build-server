@@ -13,6 +13,15 @@
 #   UBS_RECLAIM_DISK     "1" to uninstall other editor versions when installing
 #   UBS_CLEAN_IGNORED    "1" for git clean -fdx (nukes Library/)
 #   UBS_XCODE_BUILD_DIR  where Unity writes the Xcode project
+#
+# Platform (set by the server from the project's `platform` field):
+#   UBS_PLATFORM         "ios" | "android"   (Quest = android)
+#   UBS_BUILD_TARGET     Unity -buildTarget: iOS | Android
+#   UBS_ANDROID_AAB      "1" = .aab (Play), else .apk (adb / Quest)
+#   UBS_KEYSTORE_PATH / UBS_KEYSTORE_ALIAS / UBS_KEYSTORE_PASS / UBS_KEY_ALIAS_PASS
+#                        release signing; blank path = Unity debug keystore
+#   UBS_ADB              adb binary (server resolves it); UBS_DEVICE_UDID is the
+#                        adb serial on Android (host:port = ADB-over-WiFi)
 
 set -euo pipefail
 
@@ -21,6 +30,13 @@ BRANCH="${UBS_BRANCH:-main}"
 DEPLOY="${UBS_DEPLOY:-0}"
 OUTPUT_DIR="${UBS_OUTPUT_DIR:-$HOME/builds/output}"
 XCODE_BUILD_DIR="${UBS_XCODE_BUILD_DIR:-$OUTPUT_DIR/xcode}"
+PLATFORM="${UBS_PLATFORM:-ios}"
+case "$PLATFORM" in
+  ios)     BUILD_TARGET="${UBS_BUILD_TARGET:-iOS}" ;;
+  android) BUILD_TARGET="${UBS_BUILD_TARGET:-Android}" ;;
+  *) printf 'ERROR: unknown UBS_PLATFORM %q\n' "$PLATFORM" >&2; exit 1 ;;
+esac
+ANDROID_OUT_DIR="$OUTPUT_DIR/android"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # launchd gives a minimal PATH; make sure brew + unity + xcode tools are found.
@@ -28,6 +44,99 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 
 log() { printf '\n\033[1m>>> %s\033[0m\n' "$*"; }
 mkdir -p "$OUTPUT_DIR"
+
+# --- Android / Quest helpers (adb) ------------------------------------------ #
+ADB="${UBS_ADB:-}"
+resolve_adb() {
+  [[ -n "$ADB" && -x "$ADB" ]] && return 0
+  ADB="$(command -v adb 2>/dev/null || true)"
+  [[ -n "$ADB" ]] && return 0
+  # Fall back to the SDK bundled with a Hub editor's Android module.
+  ADB="$(ls -1d "$HOME"/Applications/Unity/Hub/Editor/*/PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb \
+                 /Applications/Unity/Hub/Editor/*/PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb \
+                 2>/dev/null | sort -r | head -n1 || true)"
+  [[ -n "$ADB" ]]
+}
+
+# 0 if the adb serial is connected and authorized. Connects first for host:port.
+android_device_ready() {
+  local serial="$1" state
+  resolve_adb || { log "adb not found (brew install android-platform-tools, or set adb_path)."; return 1; }
+  if [[ "$serial" == *:* ]]; then
+    log "ADB-over-WiFi: adb connect $serial"
+    "$ADB" connect "$serial" 2>&1 | sed 's/^/    /' || true
+  fi
+  "$ADB" devices -l 2>&1 | sed 's/^/    /' || true
+  state="$("$ADB" -s "$serial" get-state 2>&1 || true)"
+  case "$state" in
+    device) return 0 ;;
+    *unauthorized*)
+      log "Device $serial is UNAUTHORIZED."
+      echo "  Put on the headset / unlock the phone and accept 'Allow USB debugging'" >&2
+      echo "  (tick 'Always allow from this computer')." >&2 ;;
+    *)
+      log "Device $serial not reachable (state: ${state:-none})."
+      echo "  USB: cable in, Developer Mode on (Quest: via the Meta Horizon app)." >&2
+      echo "  WiFi: once over USB run 'adb tcpip 5555', then use <ip>:5555 as the serial." >&2 ;;
+  esac
+  return 1
+}
+
+# Install an APK via adb, classifying failures so only transient ones retry.
+install_apk_to_device() {
+  local apk="$1" serial="$UBS_DEVICE_UDID" attempt out rc
+  if [[ "$apk" == *.aab ]]; then
+    log "INSTALL SKIPPED: $apk is an App Bundle (.aab) — adb can't install it."
+    echo "  Untick 'Build AAB' to get an installable .apk, or use bundletool." >&2
+    return 1
+  fi
+  android_device_ready "$serial" || return 1
+  log "Installing $apk to $serial"
+  for attempt in 1 2 3; do
+    set +e
+    out="$("$ADB" -s "$serial" install -r "$apk" 2>&1)"; rc=$?
+    set -e
+    printf '%s\n' "$out"
+    # adb sometimes exits 0 while printing Failure — check the text too.
+    if [[ $rc -eq 0 ]] && ! printf '%s' "$out" | grep -q "Failure"; then
+      return 0
+    fi
+    if printf '%s' "$out" | grep -qE "INSTALL_FAILED_UPDATE_INCOMPATIBLE|signatures do not match"; then
+      log "INSTALL FAILED: the installed app is signed with a DIFFERENT key."
+      echo "  (e.g. a debug-keystore build over a release-signed one, or vice versa.)" >&2
+      echo "  Uninstall it first — this WIPES the app's data on the device:" >&2
+      echo "    $ADB -s $serial uninstall ${UBS_BUNDLE_ID:-<package>}" >&2
+      echo "  then tap Install on this build. Not done automatically to protect saves." >&2
+      return 1
+    fi
+    if printf '%s' "$out" | grep -qE "INSTALL_FAILED_VERSION_DOWNGRADE"; then
+      log "INSTALL FAILED: device has a HIGHER versionCode than this build."
+      echo "  Uninstall the app on the device, or bump next_build_number past it." >&2
+      return 1
+    fi
+    if printf '%s' "$out" | grep -qE "INSTALL_FAILED_INSUFFICIENT_STORAGE|not enough space"; then
+      log "INSTALL FAILED: the DEVICE is out of storage. Free space, then tap Install."
+      return 1
+    fi
+    if printf '%s' "$out" | grep -qE "INSTALL_FAILED_NO_MATCHING_ABIS|INSTALL_PARSE_FAILED|INSTALL_FAILED_OLDER_SDK"; then
+      log "INSTALL FAILED: APK incompatible with this device (ABI / minSdk / bad package)."
+      echo "  Quest needs ARM64 + IL2CPP. Fix Player Settings and rebuild." >&2
+      return 1
+    fi
+    log "Install attempt $attempt failed (transient?). Retrying in 5s…"
+    sleep 5
+    android_device_ready "$serial" >/dev/null 2>&1 || true
+  done
+  log "INSTALL FAILED after 3 tries."
+  return 1
+}
+
+launch_android_app() {
+  [[ -n "${UBS_BUNDLE_ID:-}" ]] || { log "No package name set — not launching."; return 0; }
+  "$ADB" -s "$UBS_DEVICE_UDID" shell monkey -p "$UBS_BUNDLE_ID" \
+    -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 \
+    || log "  (launch failed — start it from the device; on Quest: Library → Unknown Sources)"
+}
 
 # Install a .app to the device, classifying failures so we retry only the
 # transient ones. Returns 0 on success, 1 on give-up. Needs UBS_DEVICE_UDID.
@@ -78,8 +187,15 @@ install_app_to_device() {
 if [[ "${UBS_INSTALL_ONLY:-0}" == "1" ]]; then
   ART="${UBS_INSTALL_ARTIFACT:-}"
   log "Install-only: pushing existing artifact to device"
-  [[ -n "$UBS_DEVICE_UDID" ]] || { log "ERROR: no device UDID set."; exit 1; }
+  [[ -n "$UBS_DEVICE_UDID" ]] || { log "ERROR: no device UDID / adb serial set."; exit 1; }
   [[ -n "$ART" && -e "$ART" ]] || { log "ERROR: artifact not found: $ART"; exit 1; }
+  if [[ "$PLATFORM" == "android" ]]; then
+    if install_apk_to_device "$ART"; then
+      log "Installed. Launching…"; launch_android_app
+      log "DONE"; exit 0
+    fi
+    exit 1
+  fi
   # If the artifact is an .xcarchive or .ipa we need the .app inside; devicectl
   # installs a .app bundle. Find one if we were handed a container.
   if [[ "$ART" == *.app ]]; then
@@ -100,6 +216,9 @@ fi
 # The UI "Distribute" button re-exports an existing .xcarchive for App Store
 # distribution and uploads it to TestFlight via the ASC API key. No rebuild.
 if [[ "${UBS_DISTRIBUTE:-0}" == "1" ]]; then
+  if [[ "$PLATFORM" != "ios" ]]; then
+    log "ERROR: Distribute is TestFlight-only; not supported for $PLATFORM yet."; exit 1
+  fi
   ARCH="${UBS_DISTRIBUTE_ARCHIVE:-}"
   log "Distribute: exporting archive for App Store and uploading to TestFlight"
   [[ -n "$ARCH" && -d "$ARCH" ]] || { log "ERROR: no .xcarchive at: $ARCH"; exit 1; }
@@ -263,6 +382,17 @@ if [[ "$list_ok" != "1" ]]; then
   editors_parsed="[]"
 fi
 
+# Platform build-support modules. Android needs the SDK/NDK and OpenJDK child
+# modules too, or the Gradle step fails. Override with UBS_UNITY_MODULES
+# (space-separated) if your CLI uses different module ids.
+if [[ -n "${UBS_UNITY_MODULES:-}" ]]; then
+  read -r -a UNITY_MODULES <<< "$UBS_UNITY_MODULES"
+elif [[ "$PLATFORM" == "android" ]]; then
+  UNITY_MODULES=(android android-sdk-ndk-tools android-open-jdk)
+else
+  UNITY_MODULES=(ios)
+fi
+
 has_version() { printf '%s' "$editors_parsed" | python3 -I -c '
 import sys, json
 want = sys.argv[1]
@@ -285,8 +415,8 @@ for e in json.load(sys.stdin):
         print("uninstalling", v); subprocess.run(["unity","uninstall","-e",v], check=False)
 ' "$TARGET_VERSION"
   fi
-  log "Installing Unity $TARGET_VERSION with iOS module"
-  unity install "$TARGET_VERSION" -m ios
+  log "Installing Unity $TARGET_VERSION with modules: ${UNITY_MODULES[*]}"
+  unity install "$TARGET_VERSION" -m "${UNITY_MODULES[@]}"
   # Re-read so we can resolve the path below (same normalizing helper).
   editors_parsed="$(unity editors -i --json 2>/dev/null | python3 -I "$HERE/parse_editors.py" 2>/dev/null || echo '[]')"
 fi
@@ -306,6 +436,40 @@ if [[ ! -x "$UNITY_EXEC" ]]; then
 fi
 log "Unity executable: $UNITY_EXEC"
 
+# --- 2a. Verify the platform build-support module, not just the version ---- #
+# An editor can be installed (fast path above) yet lack this platform's module,
+# e.g. installed earlier for iOS only. Module presence = its PlaybackEngines dir,
+# which sits next to Unity.app (Hub layout) or inside it (older layouts).
+EDITOR_ROOT="$(cd "$(dirname "$UNITY_EXEC")/../../.." && pwd)"   # dir containing Unity.app
+module_missing() {
+  local pe
+  for pe in "$EDITOR_ROOT/PlaybackEngines" "$EDITOR_ROOT/Unity.app/Contents/PlaybackEngines"; do
+    if [[ "$PLATFORM" == "android" ]]; then
+      [[ -d "$pe/AndroidPlayer" && -d "$pe/AndroidPlayer/SDK" && -d "$pe/AndroidPlayer/NDK" \
+         && -d "$pe/AndroidPlayer/OpenJDK" ]] && { echo ""; return 1; }
+    else
+      [[ -d "$pe/iOSSupport" ]] && { echo ""; return 1; }
+    fi
+  done
+  if [[ "$PLATFORM" == "android" ]]; then
+    echo "Android Build Support (+ Android SDK & NDK Tools + OpenJDK)"
+  else
+    echo "iOS Build Support"
+  fi
+  return 0
+}
+if MISSING="$(module_missing)"; then
+  log "Unity $TARGET_VERSION is missing: $MISSING — installing module(s) ${UNITY_MODULES[*]}"
+  unity install "$TARGET_VERSION" -m "${UNITY_MODULES[@]}" || true
+  if MISSING="$(module_missing)"; then
+    log "ERROR: $MISSING is still not installed for Unity $TARGET_VERSION."
+    echo "  Looked under: $EDITOR_ROOT/PlaybackEngines" >&2
+    echo "  Add it in Unity Hub → Installs → $TARGET_VERSION → Add modules, then rebuild." >&2
+    exit 1
+  fi
+fi
+log "$BUILD_TARGET build support present"
+
 # Run a Unity batchmode -executeMethod call, streaming its log live. Unity on
 # macOS can't log to /dev/stdout, so we log to a file and tail it. Returns
 # Unity's exit code. Args: <method> <logfile>
@@ -319,7 +483,7 @@ run_unity_method() {
   "$UNITY_EXEC" -batchmode -nographics -quit \
     -projectPath "$PROJECT_DIR" \
     -executeMethod "$method" \
-    -buildTarget iOS -logFile "$ulog" "$@"
+    -buildTarget "$BUILD_TARGET" -logFile "$ulog" "$@"
   local rc=$?
   set -e
   sleep 1; kill "$tpid" 2>/dev/null || true
@@ -361,15 +525,40 @@ if [[ "$step_count" != "0" ]]; then
   log "All pre-build steps succeeded"
 fi
 
-# --- 3. Unity batchmode build -> Xcode project ----------------------------- #
-log "Running Unity batchmode build"
-rm -rf "$XCODE_BUILD_DIR"
+# --- 3. Unity batchmode build -> Xcode project (iOS) / APK|AAB (Android) --- #
+log "Running Unity batchmode build ($BUILD_TARGET)"
+if [[ "$PLATFORM" == "android" ]]; then
+  # Release signing: if a keystore is configured it MUST be complete — never
+  # silently fall back to the debug key for a build you meant to sign.
+  if [[ -n "${UBS_KEYSTORE_PATH:-}" ]]; then
+    [[ -f "$UBS_KEYSTORE_PATH" ]] || { log "ERROR: keystore not found: $UBS_KEYSTORE_PATH"; exit 1; }
+    [[ -n "${UBS_KEYSTORE_ALIAS:-}" ]] || { log "ERROR: keystore set but no key alias."; exit 1; }
+    if [[ -z "${UBS_KEYSTORE_PASS:-}" ]]; then
+      log "ERROR: no password for keystore $UBS_KEYSTORE_PATH."
+      echo "  Add it to config.json under \"android_keystores\" (keyed by that path, or" >&2
+      echo "  \"default\"), then restart the server." >&2
+      exit 1
+    fi
+    log "Signing with release keystore $(basename "$UBS_KEYSTORE_PATH") (alias $UBS_KEYSTORE_ALIAS)"
+  else
+    log "No keystore configured — Unity debug keystore (fine for sideloading / Quest dev)"
+  fi
+  EXT="apk"; [[ "${UBS_ANDROID_AAB:-0}" == "1" ]] && EXT="aab"
+  rm -rf "$ANDROID_OUT_DIR"; mkdir -p "$ANDROID_OUT_DIR"
+  # Name the file after package + build number so downloads are self-describing.
+  ART_NAME="$(printf '%s' "${UBS_BUNDLE_ID:-app}" | tr -c 'A-Za-z0-9._-' '_')-${UBS_BUILD_NUMBER:-local}.$EXT"
+  PLAYER_OUT="$ANDROID_OUT_DIR/$ART_NAME"
+  UNITY_LOG="$OUTPUT_DIR/android.unity-build.log"
+else
+  rm -rf "$XCODE_BUILD_DIR"
+  PLAYER_OUT="$XCODE_BUILD_DIR"
+  UNITY_LOG="${XCODE_BUILD_DIR%/}.unity-build.log"
+fi
 
 # Unity in batchmode wants to open and own its log file; handing it /dev/stdout
 # fails on macOS ("Unable to open log file, exiting"). So we log to a real file
 # and tail it into our output, which gives the live stream without the handle
 # problem. We background a tailer, run Unity, then stop the tailer.
-UNITY_LOG="${XCODE_BUILD_DIR%/}.unity-build.log"
 mkdir -p "$(dirname "$UNITY_LOG")"
 : > "$UNITY_LOG"
 tail -n +1 -f "$UNITY_LOG" & TAIL_PID=$!
@@ -380,8 +569,8 @@ set +e
 "$UNITY_EXEC" -batchmode -nographics -quit \
   -projectPath "$PROJECT_DIR" \
   -executeMethod "${UBS_BUILD_METHOD:-BuildScript.PerformiOSBuild}" \
-  -buildTarget iOS -logFile "$UNITY_LOG" \
-  -customBuildPath "$XCODE_BUILD_DIR"
+  -buildTarget "$BUILD_TARGET" -logFile "$UNITY_LOG" \
+  -customBuildPath "$PLAYER_OUT"
 UNITY_RC=$?
 set -e
 
@@ -409,6 +598,29 @@ json.dump({
 }, open(sys.argv[1], "w"), indent=2)
 PYEOF
 log "Recorded build-info.json: version=${BUILD_VERSION} build=${UBS_BUILD_NUMBER:-} commit=${BUILD_COMMIT_SHA:-}"
+
+# --- 4a. Android: Unity already produced the APK/AAB; optionally adb install - #
+if [[ "$PLATFORM" == "android" ]]; then
+  if [[ ! -f "$PLAYER_OUT" ]]; then
+    # Unity occasionally adjusts the name; take whatever it wrote.
+    PLAYER_OUT="$(ls -1t "$ANDROID_OUT_DIR"/*.apk "$ANDROID_OUT_DIR"/*.aab 2>/dev/null | head -n1 || true)"
+  fi
+  [[ -n "$PLAYER_OUT" && -f "$PLAYER_OUT" ]] || {
+    log "ERROR: Unity reported success but no .apk/.aab is in $ANDROID_OUT_DIR"; exit 1; }
+  log "Artifact: $PLAYER_OUT ($(du -h "$PLAYER_OUT" | cut -f1))"
+  if [[ "$DEPLOY" == "1" ]]; then
+    if [[ -z "${UBS_DEVICE_UDID:-}" ]]; then
+      log "Deploy requested but NO adb serial is set for this project."
+      resolve_adb && { echo "  Connected devices right now:" >&2; "$ADB" devices -l 2>&1 | sed 's/^/    /' >&2; } || true
+    elif install_apk_to_device "$PLAYER_OUT"; then
+      log "Installed to device. Launching…"; launch_android_app
+    else
+      # Same as iOS: the build is good; Install can push it later.
+      log "DONE (build succeeded, install pending — see reason above)"; exit 0
+    fi
+  fi
+  log "DONE"; exit 0
+fi
 
 # --- 4. Xcode compile/sign + optional device install ----------------------- #
 log "Building Xcode project"
