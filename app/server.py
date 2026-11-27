@@ -531,6 +531,35 @@ async def resolve_deploy_targets(build: "Build", project: Project) -> tuple[list
     return ok_ids, transports, notes
 
 
+_VERSION_CODE = re.compile(r"\bversionCode[=:](\d+)")
+
+
+async def installed_version_code(serial: str, package: str) -> Optional[int]:
+    """The versionCode of `package` installed on an adb device, or None if it
+    isn't installed / the device can't be asked. Several users or a pending
+    update can list more than one; the highest is the one that blocks installs."""
+    rc, out = await devmod._run([_adb_path(), "-s", serial, "shell",
+                                 "dumpsys", "package", package], timeout=15)
+    if rc != 0:
+        return None
+    codes = [int(m) for m in _VERSION_CODE.findall(out)]
+    return max(codes) if codes else None
+
+
+async def android_version_floor(project: Project, serials: list[str]) -> tuple[int, list[str]]:
+    """(lowest build number that installs on every target, log notes). 0 when
+    nothing relevant is installed. Unreachable devices are noted, not fatal."""
+    codes = await asyncio.gather(*[installed_version_code(s, project.bundle_id) for s in serials])
+    notes, highest = [], 0
+    for serial, code in zip(serials, codes):
+        if code is None:
+            notes.append(f"{serial}: {project.bundle_id} not installed (or unreadable) — no version constraint")
+        else:
+            notes.append(f"{serial}: has {project.bundle_id} versionCode {code}")
+            highest = max(highest, code)
+    return (highest + 1 if highest else 0), notes
+
+
 async def run_build(build: Build, project: Project) -> None:
     global CURRENT
     CURRENT = build
@@ -548,19 +577,28 @@ async def run_build(build: Build, project: Project) -> None:
     # into PlayerSettings (iOS buildNumber / Android bundleVersionCode) before
     # the player build, so stores never see a duplicate.
     is_real_build = build.source not in ("install", "distribute")
-    if is_real_build:
-        bn = reg.claim_build_number(project.id)
-        build.build_number = str(bn) if bn else ""
     platform = project.platform if project.platform in PLATFORMS else "ios"
     build_target, build_method = PLATFORMS[platform]
     store_pass, key_pass = (_keystore_passwords(project.keystore_path)
                             if platform == "android" else ("", ""))
     # Deploy targets (install runs always deploy). Resolved now, not at enqueue,
     # so a headset that woke up while the build was queued is still included.
+    # Resolved BEFORE claiming the build number so the number can be raised past
+    # whatever versionCode the targets already have installed.
     target_notes: list[str] = []
     transports: list[str] = []
     if build.deploy and build.source != "distribute":
         build.deployed_to, transports, target_notes = await resolve_deploy_targets(build, project)
+    if is_real_build:
+        floor = 0
+        if (platform == "android" and transports and project.bundle_id
+                and project.bump_version_from_devices):
+            floor, notes = await android_version_floor(project, transports)
+            target_notes.extend(notes)
+        bn = reg.claim_build_number(project.id, at_least=floor)
+        build.build_number = str(bn) if bn else ""
+        if floor and bn == floor:
+            target_notes.append(f"build number bumped to {bn} so it installs over the device's build")
     # Per-project parameters passed via env, never shell interpolation.
     env.update({
         "UBS_BUILD_ID": build.id,
@@ -588,6 +626,7 @@ async def run_build(build: Build, project: Project) -> None:
         "UBS_DEVICES": " ".join(transports),
         "UBS_DEVICE_UDID": transports[0] if transports else "",
         "UBS_RECLAIM_DISK": "1" if project.reclaim_disk else "0",
+        "UBS_UNINSTALL_ON_CONFLICT": "1" if project.uninstall_on_conflict else "0",
         "UBS_CLEAN_IGNORED": "1" if project.clean_ignored else "0",
         "UBS_OUTPUT_DIR": str(out_dir),
         "UBS_XCODE_BUILD_DIR": str(out_dir / "xcode"),
@@ -1097,7 +1136,8 @@ async def api_edit(project_id: str, request: Request, x_build_token: str = Heade
                "addressables_profile", "remote_build_path", "scripting_defines",
                "merge_from", "auto_distribute",
                "platform", "android_build_aab", "keystore_path", "keystore_alias",
-               "target_kinds", "deploy_devices"}
+               "target_kinds", "deploy_devices",
+               "bump_version_from_devices", "uninstall_on_conflict"}
     fields = {k: v for k, v in body.items() if k in allowed}
     if "platform" in fields:
         fields["platform"] = _check_platform(fields["platform"])

@@ -741,6 +741,8 @@ function toggleEdit(el, p) {
         <div><label>Key alias</label><input type="text" data-f="keystore_alias" value="${esc(p.keystore_alias)}"></div>
       </div>
       <small class="hint">Passwords are NOT stored here — put them in config.json under "android_keystores".</small>
+      <div class="toggle"><input type="checkbox" data-f="bump_version_from_devices" ${p.bump_version_from_devices!==false?"checked":""}><label>Bump the build number past the versionCode already on the target devices (checked before building)</label></div>
+      <div class="toggle"><input type="checkbox" data-f="uninstall_on_conflict" ${p.uninstall_on_conflict?"checked":""}><label>Uninstall &amp; reinstall if the device's copy still blocks the install (newer version / different key) — <b>wipes the app's data on the device</b></label></div>
     </div>
     <label>Branch <small class="hint">(pushed platform deltas must live on this branch)</small></label>
     <div class="row">

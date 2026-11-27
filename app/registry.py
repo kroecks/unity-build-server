@@ -71,6 +71,16 @@ class Project:
     android_build_aab: bool = False     # True = .aab (Play Store), False = .apk (adb / Quest)
     keystore_path: str = ""             # absolute path on the mini, e.g. ~/keys/game.keystore
     keystore_alias: str = ""
+    # Version-code conflicts with what's already on a device (Android refuses
+    # INSTALL_FAILED_VERSION_DOWNGRADE when the installed versionCode is higher):
+    # bump_version_from_devices: before a deploying build, read the installed
+    #   versionCode from each target and raise next_build_number past it, so the
+    #   build can always install. No data loss; the number just jumps ahead.
+    # uninstall_on_conflict: if an install STILL conflicts (an older artifact
+    #   re-pushed with Install, a newer build landed mid-build, or a different
+    #   signing key), uninstall the app and reinstall. WIPES the app's data.
+    bump_version_from_devices: bool = True
+    uninstall_on_conflict: bool = False
     # behaviour
     webhook_deploys: bool = False       # does a git push also install to phone?
     reclaim_disk: bool = True           # uninstall other editor versions when installing
@@ -216,16 +226,18 @@ class Registry:
             self._write(data)
             return Project.from_record(data[project_id])
 
-    def claim_build_number(self, project_id: str) -> int:
+    def claim_build_number(self, project_id: str, at_least: int = 0) -> int:
         """Atomically return this project's next build number and increment the
         stored counter, so each build gets a unique, monotonically-increasing
         number (stores reject duplicates). Under the lock so two builds can't
-        claim the same one."""
+        claim the same one. `at_least` raises the floor (e.g. past a versionCode
+        already installed on a device); the counter never goes backwards."""
         with self._lock:
             data = self._read()
             if project_id not in data:
                 return 0
             n = int(data[project_id].get("next_build_number", 1) or 1)
+            n = max(n, int(at_least or 0))
             data[project_id]["next_build_number"] = n + 1
             self._write(data)
             return n

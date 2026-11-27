@@ -99,9 +99,24 @@ android_device_ready() {
   return 1
 }
 
+# Opt-in (project setting "Uninstall & reinstall", UBS_UNINSTALL_ON_CONFLICT=1):
+# remove the installed app so a conflicting build can go on. WIPES its data.
+# Uses the caller's `uninstalled` flag so it happens at most once per install.
+uninstall_for_reinstall() {
+  local serial="$1" why="$2" out
+  [[ "${UBS_UNINSTALL_ON_CONFLICT:-0}" == "1" ]] || return 1
+  [[ "${uninstalled:-0}" == "0" ]] || return 1
+  [[ -n "${UBS_BUNDLE_ID:-}" ]] || { log "Can't uninstall: no package name set on the project."; return 1; }
+  log "Installed ${UBS_BUNDLE_ID} on $serial $why — uninstalling (app data is wiped) and reinstalling"
+  out="$("$ADB" -s "$serial" uninstall "$UBS_BUNDLE_ID" 2>&1)" || true
+  printf '%s\n' "$out" | sed 's/^/    /'
+  printf '%s' "$out" | grep -q "Success" || { log "Uninstall failed — see above."; return 1; }
+  return 0
+}
+
 # Install an APK via adb, classifying failures so only transient ones retry.
 install_apk_to_device() {
-  local apk="$1" serial="$2" attempt out rc
+  local apk="$1" serial="$2" attempt out rc uninstalled=0 flags="-r"
   if [[ "$apk" == *.aab ]]; then
     log "INSTALL SKIPPED: $apk is an App Bundle (.aab) — adb can't install it."
     echo "  Untick 'Build AAB' to get an installable .apk, or use bundletool." >&2
@@ -109,9 +124,12 @@ install_apk_to_device() {
   fi
   android_device_ready "$serial" || return 1
   log "Installing $apk to $serial"
-  for attempt in 1 2 3; do
+  # Only transient failures count against the 3 tries; the downgrade (-d) and
+  # uninstall fallbacks each happen at most once, so the loop stays bounded.
+  attempt=0
+  while (( attempt < 3 )); do
     set +e
-    out="$("$ADB" -s "$serial" install -r "$apk" 2>&1)"; rc=$?
+    out="$("$ADB" -s "$serial" install $flags "$apk" 2>&1)"; rc=$?
     set -e
     printf '%s\n' "$out"
     # adb sometimes exits 0 while printing Failure — check the text too.
@@ -119,16 +137,31 @@ install_apk_to_device() {
       return 0
     fi
     if printf '%s' "$out" | grep -qE "INSTALL_FAILED_UPDATE_INCOMPATIBLE|signatures do not match"; then
+      if uninstall_for_reinstall "$serial" "signed with a different key"; then
+        uninstalled=1; continue
+      fi
       log "INSTALL FAILED: the installed app is signed with a DIFFERENT key."
       echo "  (e.g. a debug-keystore build over a release-signed one, or vice versa.)" >&2
       echo "  Uninstall it first — this WIPES the app's data on the device:" >&2
       echo "    $ADB -s $serial uninstall ${UBS_BUNDLE_ID:-<package>}" >&2
-      echo "  then tap Install on this build. Not done automatically to protect saves." >&2
+      echo "  then tap Install on this build — or tick 'Uninstall & reinstall' in the" >&2
+      echo "  project settings to have it done automatically (off by default to protect saves)." >&2
       return 1
     fi
     if printf '%s' "$out" | grep -qE "INSTALL_FAILED_VERSION_DOWNGRADE"; then
+      # Non-destructive first: -d allows a downgrade for debuggable (dev) builds
+      # and keeps the app's data. Release builds refuse it, so fall through.
+      if [[ "$flags" != *-d* ]]; then
+        log "Device has a newer versionCode — retrying as a downgrade (adb install -d, keeps data)"
+        flags="-r -d"; continue
+      fi
+      if uninstall_for_reinstall "$serial" "has a HIGHER versionCode"; then
+        uninstalled=1; continue
+      fi
       log "INSTALL FAILED: device has a HIGHER versionCode than this build."
-      echo "  Uninstall the app on the device, or bump next_build_number past it." >&2
+      echo "  Uninstall the app on the device, or tick 'Uninstall & reinstall' in the" >&2
+      echo "  project settings (wipes app data). New builds bump past the device's" >&2
+      echo "  versionCode automatically when 'Bump the build number' is ticked." >&2
       return 1
     fi
     if printf '%s' "$out" | grep -qE "INSTALL_FAILED_INSUFFICIENT_STORAGE|not enough space"; then
@@ -140,6 +173,8 @@ install_apk_to_device() {
       echo "  Quest needs ARM64 + IL2CPP. Fix Player Settings and rebuild." >&2
       return 1
     fi
+    attempt=$((attempt + 1))
+    (( attempt < 3 )) || break
     log "Install attempt $attempt failed (transient?). Retrying in 5s…"
     sleep 5
     android_device_ready "$serial" >/dev/null 2>&1 || true
