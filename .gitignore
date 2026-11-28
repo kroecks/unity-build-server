@@ -4,6 +4,7 @@ config/config.json
 # The project registry the service writes — contains per-project paths/IDs.
 config/projects.json
 config/devices.json
+config/launch_profiles.json
 # Any stray env files
 .env
 *.env

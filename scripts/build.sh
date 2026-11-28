@@ -25,6 +25,11 @@
 #                        release signing; blank path = Unity debug keystore
 #   UBS_ADB              adb binary (server resolves it); UBS_DEVICE_UDID is the
 #                        adb serial on Android (host:port = ADB-over-WiFi)
+#   UBS_LAUNCH_PLAN      Android: TSV file, "<adb serial>\t<keep-awake min>\t<args>"
+#                        per line — how each device's app is started after install:
+#                        args go to `am start -e unity "<args>"`; keep-awake > 0
+#                        holds the device awake that long. A serial with no line
+#                        (or no file) gets a plain launch.
 
 set -euo pipefail
 
@@ -183,9 +188,88 @@ install_apk_to_device() {
   return 1
 }
 
+# Launch setting "keep awake N min" (from the launch plan; 0 = off):
+# make the Quest act as if it's on someone's head for N minutes, so
+# the display stays on and the app isn't paused while the headset sits on the
+# desk (e.g. to finish a first-launch download). Same broadcast MQDH's
+# "disable proximity sensor" toggle sends. A detached timer sends
+# automation_disable afterwards; it holds none of build.sh's output, so the
+# build finishes right away. A newer deploy to the same headset takes over the
+# timer (per-serial token file), so an older timer never cuts a newer one short.
+# Never fails the build.
+keep_awake_android() {
+  local serial="$1" mins="${2:-0}" secs state_dir token_file token
+  [[ "$mins" =~ ^[0-9]+$ ]] && (( mins >= 1 )) || return 0
+  secs=$(( mins * 60 ))
+  if ! "$ADB" -s "$serial" shell am broadcast -a com.oculus.vrpowermanager.prox_close >/dev/null 2>&1; then
+    log "  (keep-awake: proximity override failed on $serial — not a Quest, or adb dropped)"
+    return 0
+  fi
+  "$ADB" -s "$serial" shell input keyevent KEYCODE_WAKEUP >/dev/null 2>&1 || true
+  state_dir="${TMPDIR:-/tmp}/ubs-keep-awake"
+  mkdir -p "$state_dir" 2>/dev/null || true
+  token_file="$state_dir/${serial//[^A-Za-z0-9._-]/_}"
+  token="${UBS_BUILD_ID:-build}-$$-$RANDOM"
+  printf '%s' "$token" > "$token_file" 2>/dev/null || true
+  (
+    trap '' HUP
+    sleep "$secs"
+    # Only revert if no newer deploy to this headset has taken over.
+    if [[ "$(cat "$token_file" 2>/dev/null)" == "$token" ]]; then
+      "$ADB" -s "$serial" shell am broadcast -a com.oculus.vrpowermanager.automation_disable >/dev/null 2>&1 || true
+      rm -f "$token_file"
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+  disown $! 2>/dev/null || true
+  log "  Keep-awake: $serial will act as worn for ${mins} min (then the proximity sensor is back to normal)."
+  echo "    End it early: $ADB -s $serial shell am broadcast -a com.oculus.vrpowermanager.automation_disable" >&2
+}
+
+# This serial's launch settings from the plan -> PLAN_AWAKE (minutes, 0 = off)
+# and PLAN_ARGS ("" = none). Both empty/0 when the serial has no line.
+read_launch_plan() {
+  local serial="$1" s m a
+  PLAN_AWAKE=0; PLAN_ARGS=""
+  [[ -n "${UBS_LAUNCH_PLAN:-}" && -f "$UBS_LAUNCH_PLAN" ]] || return 0
+  while IFS=$'\t' read -r s m a || [[ -n "$s" ]]; do
+    if [[ "$s" == "$serial" ]]; then PLAN_AWAKE="${m:-0}"; PLAN_ARGS="$a"; return 0; fi
+  done < "$UBS_LAUNCH_PLAN"
+  return 0
+}
+
+# Launch with the given args as Unity's command line: `am start -e unity "<args>"`
+# (Unity reads the "unity" intent extra as player command-line arguments). Needs
+# the launcher activity's name, so ask the package manager for it.
+launch_android_app_with_args() {
+  local serial="$1" args="$2" comp q out
+  comp="$("$ADB" -s "$serial" shell cmd package resolve-activity --brief \
+            -c android.intent.category.LAUNCHER "$UBS_BUNDLE_ID" 2>/dev/null \
+          | tr -d '\r' | grep '/' | tail -n 1 || true)"
+  if [[ -z "$comp" ]]; then
+    comp="$UBS_BUNDLE_ID/com.unity3d.player.UnityPlayerActivity"
+    log "  (couldn't resolve the launcher activity; trying $comp)"
+  fi
+  # adb shell joins its arguments into ONE command line for the device's sh, so
+  # single-quote the args for it (and escape any single quotes inside).
+  q="$(printf '%s' "$args" | sed "s/'/'\\\\''/g")"
+  log "  Launching $comp with args: $args"
+  # -S: force-stop first, so the args always reach a fresh start.
+  out="$("$ADB" -s "$serial" shell am start -S -n "$comp" -e unity "'$q'" 2>&1 || true)"
+  if printf '%s' "$out" | grep -qiE "^Error|Exception"; then
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    log "  (launch failed — start it from the device; on Quest: Library → Unknown Sources)"
+  fi
+}
+
 launch_android_app() {
   local serial="$1"
+  read_launch_plan "$serial"
+  keep_awake_android "$serial" "$PLAN_AWAKE"
   [[ -n "${UBS_BUNDLE_ID:-}" ]] || { log "No package name set — not launching."; return 0; }
+  if [[ -n "$PLAN_ARGS" ]]; then
+    launch_android_app_with_args "$serial" "$PLAN_ARGS"
+    return 0
+  fi
   "$ADB" -s "$serial" shell monkey -p "$UBS_BUNDLE_ID" \
     -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 \
     || log "  (launch failed — start it from the device; on Quest: Library → Unknown Sources)"

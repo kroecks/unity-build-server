@@ -22,7 +22,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .badge.warn { background:#7c2d12; color:#fed7aa; }
   .badge.ok { background:#14532d; color:#bbf7d0; }
   label { font-size:13px; opacity:.8; display:block; margin:8px 0 3px; }
-  input[type=text], input[type=password], select {
+  input[type=text], input[type=password], input[type=number], select, textarea {
       width:100%; background:#05070a; color:#e6e8eb; border:1px solid #2a2f3a;
       border-radius:8px; padding:10px 12px; font-size:15px; }
   .row { display:flex; gap:8px; flex-wrap:wrap; }
@@ -212,6 +212,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="sec" id="devConnect">Connect</button>
     </div>
     <div class="meta" id="devOut" style="white-space:pre-wrap"></div>
+  </div>
+
+  <div class="logbar" style="margin-top:4px">
+    <h2 style="margin:0"><button class="sec collapser" id="lpToggle" aria-expanded="false" aria-controls="lpSection">
+      <span class="caret">▸</span> Launch profiles <span class="hint" id="lpSummary"></span></button></h2>
+    <span><button class="sec" id="lpAdd">+ Profile</button></span>
+  </div>
+  <div id="lpSection" style="display:none">
+    <div class="card" style="padding:8px 12px">
+      <div class="meta">Named launch settings (args, keep awake), shared by every project. Each target (device) in
+        Install / Build to… launches with one of these; projects pick defaults in their settings.</div>
+      <div id="lpList"></div>
+      <div class="btn-row"><button id="lpSave">Save profiles</button></div>
+    </div>
   </div>
 
   <div id="projects"></div>
@@ -468,7 +482,22 @@ $("devConnect").onclick = () => devWifi("connect");
 // ---- device picker (Install / Build to… / logs) -------------------------- //
 // Resolves to an array of device ids, or null if cancelled. multi=false is a
 // single choice (logs) and auto-picks when exactly one device is online.
-function pickDevices(p, { title, go, multi = true }) {
+function pickDevices(p, { title, go, multi = true, launch = false }) {
+  // launch=true (Android Install / Build to…): each checked target also picks
+  // what it launches with; resolves to { ids, launches: [{target, profile, args}] }
+  // instead of the bare id array. One entry per target today; the same plan
+  // shape is meant to hold simulators / local processes (several per kind) later.
+  const withLaunch = launch && (p.platform || "ios") === "android";
+  const plan = new Map();   // target id -> { choice: ""|name|CUSTOM, args }
+  const planFor = (id) => {
+    if (!plan.has(id)) {
+      const dl = p.default_launches || {};
+      const name = id in dl ? dl[id] : (p.default_launch_profile || "");
+      const lp = lpByName(name);
+      plan.set(id, { choice: lp ? name : "", args: "", awake: lp ? lp.keep_awake_minutes || 0 : 0 });
+    }
+    return plan.get(id);
+  };
   return new Promise(async resolve => {
     let list = [], incompatible = 0;
     const fetchList = async (refresh) => {
@@ -502,12 +531,19 @@ function pickDevices(p, { title, go, multi = true }) {
             ${d.default ? '<span class="badge ok">default</span>' : ""}
             <div class="meta">${esc(devState(d))}</div></div>`;
         const inp = row.querySelector("input");
+        // Launch controls sit OUTSIDE the <label> so clicking them never toggles the device.
+        const lrow = withLaunch && d.online ? launchRow(planFor(d.id)) : null;   // display set by sync()
         inp.onchange = () => {
           if (!multi) checked.clear();
           inp.checked ? checked.add(d.id) : checked.delete(d.id);
           update();
         };
         wrap.appendChild(row);
+        if (lrow) {
+          const sync = () => { const on = checked.has(d.id); lrow.style.display = on ? "block" : "none";
+                               row.style.borderBottom = on ? "none" : ""; };
+          inp.addEventListener("change", sync); sync(); wrap.appendChild(lrow);
+        }
       }
       update();
     };
@@ -522,19 +558,167 @@ function pickDevices(p, { title, go, multi = true }) {
     $("pickRescan").onclick = async () => { await fetchList(true);
       for (const id of [...checked]) if (!list.some(d => d.id === id && d.online)) checked.delete(id);
       render(); };
-    $("pickGo").onclick = () => close([...checked]);
+    $("pickGo").onclick = () => {
+      const ids = [...checked];
+      if (!withLaunch) return close(ids);
+      close({ ids, launches: ids.map(id => {
+        const e = planFor(id);
+        // keep_awake_minutes is always sent: the row shows it and may override the profile's.
+        return e.choice === LP_CUSTOM ? { target: id, profile: "", args: e.args, keep_awake_minutes: e.awake }
+                                      : { target: id, profile: e.choice, args: "", keep_awake_minutes: e.awake };
+      }) });
+    };
     render();
     $("picker").style.display = "flex";
   });
 }
 
+// ---- launch profiles (shared library) ------------------------------------ //
+let LAUNCH_PROFILES = [];
+const LP_CUSTOM = "__ubs_custom__";
+const lpByName = (n) => n ? LAUNCH_PROFILES.find(x => x.name === n) : null;
+async function loadLaunchProfiles() {
+  try { LAUNCH_PROFILES = (await (await fetch("/api/launch-profiles")).json()).profiles || []; }
+  catch(e) { LAUNCH_PROFILES = []; }
+  renderLaunchProfiles();
+}
+async function saveLaunchProfiles(list) {
+  const r = await api("PUT", "/api/launch-profiles", { profiles: list });
+  LAUNCH_PROFILES = r.profiles || [];
+  renderLaunchProfiles();
+}
+let lpDraft = null;   // edits in the Launch profiles section, until Save
+function renderLaunchProfiles() {
+  $("lpSummary").textContent = LAUNCH_PROFILES.length ? `(${LAUNCH_PROFILES.length})` : "";
+  const list = lpDraft || (lpDraft = LAUNCH_PROFILES.map(x => ({ ...x })));
+  const wrap = $("lpList"); wrap.innerHTML = "";
+  if (!list.length) wrap.innerHTML = '<div class="meta" style="margin-top:6px">No profiles yet — + Profile, or “Save as…” on a custom launch in the Install dialog.</div>';
+  list.forEach((lp, idx) => {
+    const row = document.createElement("div");
+    row.className = "card"; row.style.padding = "8px"; row.style.margin = "6px 0";
+    row.innerHTML = `
+      <div class="row">
+        <input type="text" placeholder="name, e.g. smoke" value="${esc(lp.name)}" data-k="name" style="flex:1">
+        <button class="danger" data-m="rm" style="flex:0 0 auto">✕</button>
+      </div>
+      <textarea rows="2" placeholder="launch args, e.g. -DFlag1 -DFlag2" data-k="args"
+                style="margin-top:4px; font-family:ui-monospace,monospace; font-size:13px">${esc(lp.args)}</textarea>`;
+    row.querySelectorAll("[data-k]").forEach(i => { i.oninput = () => { lp[i.dataset.k] = i.value; }; });
+    row.appendChild(awakeControl(() => lp.keep_awake_minutes || 0, v => { lp.keep_awake_minutes = v; }));
+    row.querySelector('[data-m="rm"]').onclick = () => { list.splice(idx, 1); renderLaunchProfiles(); };
+    wrap.appendChild(row);
+  });
+}
+function setLpOpen(open) {
+  $("lpSection").style.display = open ? "block" : "none";
+  $("lpToggle").setAttribute("aria-expanded", open ? "true" : "false");
+}
+$("lpToggle").onclick = () => setLpOpen($("lpSection").style.display === "none");
+$("lpAdd").onclick = () => { setLpOpen(true); lpDraft = lpDraft || []; lpDraft.push({ name: "", args: "", keep_awake_minutes: 0 }); renderLaunchProfiles(); };
+$("lpSave").onclick = async () => {
+  const list = (lpDraft || []).map(x => ({ name: x.name.trim(), args: x.args, keep_awake_minutes: x.keep_awake_minutes || 0 }))
+    .filter(x => x.name || x.args.trim() || x.keep_awake_minutes);
+  try { lpDraft = null; await saveLaunchProfiles(list); await loadProjects(); }   // defaults may have been cleared
+  catch(e) { lpDraft = list; renderLaunchProfiles(); alert("Save failed: " + e.message); }
+};
+
+// <option>s for a launch-profile <select>. extra = leading [value, text] pairs.
+function lpOptions(selected, extra) {
+  return extra.concat(LAUNCH_PROFILES.map(x => [x.name, x.name]))
+    .map(([v, t]) => `<option value="${esc(v)}" ${v === selected ? "selected" : ""}>${esc(t)}</option>`).join("");
+}
+
+// One target's launch control in the picker: profile / no args / custom text.
+// "Keep awake [N] min" control (0 = off). Effect varies by device: on Quest it
+// overrides the proximity sensor so the app keeps running off-head.
+function awakeControl(get, set) {
+  const w = document.createElement("label");
+  w.style.cssText = "display:flex; align-items:center; gap:6px; margin:4px 0 0; opacity:1; flex:0 0 auto";
+  w.title = "Keep the device awake after launch (Quest: proximity override). Effect varies by device.";
+  const draw = () => {
+    const on = get() > 0;
+    w.innerHTML = `<input type="checkbox" ${on ? "checked" : ""} style="width:18px;height:18px">
+      <span>Keep awake</span>
+      <input type="number" min="1" max="240" step="1" value="${on ? get() : 10}" ${on ? "" : "disabled"}
+             style="width:80px; padding:6px 8px"> <span>min</span>`;
+    const [cb, num] = w.querySelectorAll("input");
+    cb.onchange = () => { set(cb.checked ? Math.max(1, parseInt(num.value) || 10) : 0); draw(); };
+    num.oninput = () => { const v = parseInt(num.value); if (v > 0) set(Math.min(240, v)); };
+  };
+  draw();
+  return w;
+}
+
+// One target's launch settings in the picker: a profile (or custom args) and
+// keep-awake. Picking a profile loads its settings; keep-awake can be changed
+// per target without leaving the profile.
+function launchRow(entry) {
+  const el = document.createElement("div");
+  el.style.cssText = "padding:0 4px 10px 34px; border-bottom:1px solid #222733; flex-direction:column";
+  const draw = () => {
+    const custom = entry.choice === LP_CUSTOM;
+    el.innerHTML = `<div class="row" style="align-items:center">
+      <select data-l="choice" style="flex:1">${lpOptions(entry.choice,
+        [["", "▶ launch with no arguments"]])}
+        <option value="${LP_CUSTOM}" ${custom ? "selected" : ""}>Custom…</option></select>
+      ${custom ? `<input type="text" data-l="args" value="${esc(entry.args)}" placeholder="-DFlag1 -DFlag2"
+                   style="flex:2; font-family:ui-monospace,monospace; font-size:13px">` : ""}
+      </div><div class="row" data-l="awakeRow" style="align-items:center; justify-content:space-between"></div>`;
+    const ar = el.querySelector('[data-l="awakeRow"]');
+    ar.appendChild(awakeControl(() => entry.awake, v => { entry.awake = v; }));
+    if (custom) {
+      const sb = document.createElement("button");
+      sb.className = "sec"; sb.style.flex = "0 0 auto"; sb.textContent = "Save as profile…";
+      sb.title = "Save these launch settings as a shared launch profile";
+      sb.onclick = async () => {
+        const name = (prompt("Save these launch settings as a shared launch profile named:") || "").trim();
+        if (!name) return;
+        if (lpByName(name) && !confirm(`Replace the existing profile "${name}"?`)) return;
+        try {
+          await saveLaunchProfiles(LAUNCH_PROFILES.filter(x => x.name !== name)
+            .concat([{ name, args: entry.args, keep_awake_minutes: entry.awake }]));
+          lpDraft = null; renderLaunchProfiles();
+          entry.choice = name; draw();
+        } catch(e) { alert("Save failed: " + e.message); }
+      };
+      ar.appendChild(sb);
+    }
+    const sel = el.querySelector('[data-l="choice"]');
+    sel.onchange = () => {
+      const prev = lpByName(entry.choice);
+      if (sel.value === LP_CUSTOM) { if (prev) entry.args = prev.args; }   // start custom from the profile
+      else { const lp = lpByName(sel.value); entry.awake = lp ? lp.keep_awake_minutes || 0 : 0; }
+      entry.choice = sel.value; draw();
+    };
+    const ai = el.querySelector('[data-l="args"]'); if (ai) ai.oninput = () => { entry.args = ai.value; };
+  };
+  draw();
+  return el;
+}
+
+// "· ▶ smoke ×2, custom ☀" on builds that launched with settings (☀ = kept
+// awake; the tooltip lists each target's settings).
+function launchLabel(b) {
+  const ls = (b.launches || []).filter(e => e.args || e.keep_awake_minutes);
+  if (!b.deploy || !ls.length) return "";
+  const counts = new Map();
+  for (const e of ls) { const k = e.profile || "custom"; counts.set(k, (counts.get(k) || 0) + 1); }
+  const text = [...counts].map(([k, n]) => n > 1 ? `${k} ×${n}` : k).join(", ")
+             + (ls.some(e => e.keep_awake_minutes) ? " ☀" : "");
+  const title = ls.map(e => `${e.profile || "custom"}: ${[e.args, e.keep_awake_minutes ? `keep awake ${e.keep_awake_minutes} min` : ""]
+                                                         .filter(Boolean).join(" · ")}`).join("\n");
+  return ` · <span title="${esc(title)}">▶ ${esc(text)}</span>`;
+}
+
 async function installTo(projectId, buildId, btn) {
   const p = PROJS.find(x => x.id === projectId);
   if (!p) { alert("Project no longer exists"); return; }
-  const ids = await pickDevices(p, { title: "Install to…", go: "Install" });
+  const pick = await pickDevices(p, { title: "Install to…", go: "Install", launch: true });
+  const ids = pick && (Array.isArray(pick) ? pick : pick.ids);
   if (!ids || !ids.length) return;
+  const body = Array.isArray(pick) ? { devices: ids } : { devices: ids, launches: pick.launches };
   if (btn) { btn.disabled = true; btn.textContent = "Installing…"; }
-  try { await api("POST", `/build/${projectId}/install/${buildId}`, { devices: ids }); refreshStatus(); }
+  try { await api("POST", `/build/${projectId}/install/${buildId}`, body); refreshStatus(); }
   catch(e){ alert("Install failed: " + e.message); }
   finally { if (btn) { btn.disabled = false; btn.textContent = "📲 Install"; } }
 }
@@ -695,8 +879,9 @@ function projectCard(p) {
   setOpen((() => { try { return localStorage.getItem("ubs_open_" + p.id) === "1"; } catch(e) { return false; } })());
   el.querySelector('[data-act="build"]').onclick = (ev) => { ev.stopPropagation(); startBuild(p); };
   el.querySelector('[data-act="buildto"]').onclick = async () => {
-    const ids = await pickDevices(p, { title: "Build and install to…", go: "Build & install" });
-    if (ids && ids.length) startBuild(p, ids);
+    const pick = await pickDevices(p, { title: "Build and install to…", go: "Build & install", launch: true });
+    const ids = pick && (Array.isArray(pick) ? pick : pick.ids);
+    if (ids && ids.length) startBuild(p, ids, Array.isArray(pick) ? null : pick);
   };
   el.querySelector('[data-act="edit"]').onclick = () => toggleEdit(el, p);
   wireStatus(el, p);
@@ -743,6 +928,10 @@ function toggleEdit(el, p) {
       <small class="hint">Passwords are NOT stored here — put them in config.json under "android_keystores".</small>
       <div class="toggle"><input type="checkbox" data-f="bump_version_from_devices" ${p.bump_version_from_devices!==false?"checked":""}><label>Bump the build number past the versionCode already on the target devices (checked before building)</label></div>
       <div class="toggle"><input type="checkbox" data-f="uninstall_on_conflict" ${p.uninstall_on_conflict?"checked":""}><label>Uninstall &amp; reinstall if the device's copy still blocks the install (newer version / different key) — <b>wipes the app's data on the device</b></label></div>
+      <label style="margin-top:14px">Default launch profile <small class="hint">(how each target starts the app — args, keep awake — after Build / git-push deploys; preselected in Install / Build to… — manage profiles under “Launch profiles”)</small></label>
+      <select data-lp-default></select>
+      <label>Per-target override <small class="hint">(a default target can launch something else)</small></label>
+      <div data-lp-targets></div>
     </div>
     <label>Branch <small class="hint">(pushed platform deltas must live on this branch)</small></label>
     <div class="row">
@@ -881,6 +1070,42 @@ function toggleEdit(el, p) {
   };
   area._getSteps = () => steps;  // save handler reads this
 
+  // ---- launch defaults (Android). Not data-f fields: read via _getLaunch.
+  let lpDefault = lpByName(p.default_launch_profile) ? p.default_launch_profile : "";
+  const lpOver = { ...(p.default_launches || {}) };      // target id -> profile ("" = no args)
+  const LP_INHERIT = "__ubs_inherit__";
+  const lpSel = area.querySelector("[data-lp-default]");
+  lpSel.innerHTML = lpOptions(lpDefault, [["", "— none (plain launch) —"]]);
+  lpSel.onchange = () => { lpDefault = lpSel.value; renderLpTargets(); };
+  const curTargets = () => (area._getTargeting ? area._getTargeting().deploy_devices : null) || defaultIds(p);
+  const renderLpTargets = () => {
+    const w = area.querySelector("[data-lp-targets]"); w.innerHTML = "";
+    const ids = curTargets();
+    if (!ids.length) { w.innerHTML = '<div class="meta">No default targets.</div>'; return; }
+    for (const id of ids) {
+      const d = devById(id);
+      const row = document.createElement("div"); row.className = "row"; row.style.alignItems = "center"; row.style.marginTop = "4px";
+      const cur = id in lpOver ? lpOver[id] : LP_INHERIT;
+      row.innerHTML = `<div class="meta" style="flex:1">${esc(d ? d.name : id)}</div>
+        <select style="flex:2">${lpOptions(cur, [[LP_INHERIT, `same as default${lpDefault ? " (" + lpDefault + ")" : ""}`],
+                                                ["", "no arguments"]])}</select>`;
+      const sel = row.querySelector("select");
+      sel.onchange = () => { if (sel.value === LP_INHERIT) delete lpOver[id]; else lpOver[id] = sel.value; };
+      w.appendChild(row);
+    }
+  };
+  // Re-render when default targets are ticked / unticked.
+  area.querySelector("[data-targets]").addEventListener("change", () => setTimeout(renderLpTargets, 0));
+  setTimeout(renderLpTargets, 0);   // after the targeting UI has wired _getTargeting
+  area._getLaunch = () => {
+    const ids = new Set(curTargets());
+    return {
+      default_launch_profile: lpDefault,
+      // Keep overrides for current default targets only.
+      default_launches: Object.fromEntries(Object.entries(lpOver).filter(([id]) => ids.has(id))),
+    };
+  };
+
   // ---- branch loader ----
   area.querySelector('[data-s="loadbr"]').onclick = async () => {
     const sel = area.querySelector(`#branchSel-${p.id}`);
@@ -902,6 +1127,7 @@ function toggleEdit(el, p) {
     });
     fields.pre_build_steps = area._getSteps();  // from the steps editor
     Object.assign(fields, area._getTargeting());
+    Object.assign(fields, area._getLaunch());
     try { await api("PATCH", `/api/projects/${p.id}`, fields); await loadProjects(); }
     catch(e){ alert("Save failed: " + e.message); }
   };
@@ -984,13 +1210,15 @@ let es = null;
 let currentBuildId = null;   // the build currently shown/streaming, for Stop
 function setState(s){ const el=$("state"); el.textContent=s; el.className=s.split(" ")[0]; }
 function showStop(on){ $("stopBuild").style.display = on ? "inline-block" : "none"; }
-async function startBuild(p, deviceIds) {
+async function startBuild(p, deviceIds, launch) {
   $("buildCard").style.display="block";
   $("buildTitle").textContent = "Building: " + p.name;
   $("log").textContent=""; setState("submitting");
   $("buildCard").scrollIntoView({behavior:"smooth"});
   try {
-    const b = await api("POST", `/build/${p.id}`, deviceIds ? { devices: deviceIds } : undefined);
+    const body = deviceIds ? { devices: deviceIds } : undefined;
+    if (body && launch) body.launches = launch.launches;
+    const b = await api("POST", `/build/${p.id}`, body);
     setState(b.state); stream(b.id);
   } catch(e){ setState("failed: " + e.message); }
 }
@@ -1327,7 +1555,7 @@ function allBuildRow(b) {
     </div>
     ${idline}${labelline}
     <div class="meta">${when}${dur} · ${esc(b.state)}${rc}${
-      b.deploy && (b.device_names||[]).length ? " · → " + esc(b.device_names.join(", ")) : ""}</div>${actions}`;
+      b.deploy && (b.device_names||[]).length ? " · → " + esc(b.device_names.join(", ")) : ""}${launchLabel(b)}</div>${actions}`;
   if (selectModeOn) {
     const cb = el.querySelector(".selbox");
     cb.onclick = (ev) => { ev.stopPropagation();
@@ -1693,7 +1921,7 @@ document.addEventListener("click", ev => {
 });
 
 function esc(s){ return (s||"").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-loadProjects().then(() => { loadDevices(); loadProjectStatus(false); openBuildFromHash(); });
+loadLaunchProfiles().then(loadProjects).then(() => { loadDevices(); loadProjectStatus(false); openBuildFromHash(); });
 // ---- host utilisation bar (sticky, top of page) -------------------------- //
 // CPU / memory / disk of the build machine with ~10 min sparklines. The pill
 // sums it up: how much headroom is there for another build or project?

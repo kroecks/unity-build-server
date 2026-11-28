@@ -52,7 +52,7 @@ from fastapi import FastAPI, Request, HTTPException, Header, Query
 from fastapi.responses import (HTMLResponse, JSONResponse, StreamingResponse,
                                PlainTextResponse, FileResponse)
 
-from .registry import Registry, Project, RegistryWriteError
+from .registry import Registry, Project, RegistryWriteError, LaunchProfiles, clean_profile
 from . import onboarding
 from . import devices as devmod
 from . import repostatus
@@ -105,6 +105,10 @@ ANDROID_KEYSTORES = CFG.get("android_keystores", {}) or {}
 # SDK bundled with any Hub-installed editor's Android module.
 ADB_CFG = str(Path(CFG["adb_path"]).expanduser()) if CFG.get("adb_path") else ""
 
+# Upper bound for a launch's "keep awake" time, so a typo can't leave a
+# headset's display on for days.
+KEEP_AWAKE_MAX_MINUTES = 240
+
 PLATFORMS = {
     # platform -> (Unity -buildTarget, BuildScript entry point)
     "ios": ("iOS", "BuildScript.PerformiOSBuild"),
@@ -144,6 +148,9 @@ def _adb_path() -> str:
     return "adb"   # let it fail with a clear "command not found"
 
 reg = Registry(REGISTRY_PATH)
+# Shared launch-profile library (named argument sets every project can use).
+LAUNCH_PROFILES = LaunchProfiles(Path(CFG.get(
+    "launch_profiles_path", str(REGISTRY_PATH.parent / "launch_profiles.json"))).expanduser())
 # Device inventory (phones / tablets / headsets) — see app/devices.py.
 DEVICES_PATH = Path(CFG.get("devices_path", str(REGISTRY_PATH.parent / "devices.json"))).expanduser()
 DEVICES = devmod.DeviceStore(DEVICES_PATH, _adb_path)
@@ -189,6 +196,18 @@ class Build:
     # online and handed to the build script.
     devices: list = field(default_factory=list)
     deployed_to: list = field(default_factory=list)
+    # Launch plan: what to start after install, one entry per launch:
+    #   {"target": <device id>, "profile": <shared profile name or "">,
+    #    "args": "...", "keep_awake_minutes": N}
+    # i.e. a launch profile's settings (registry.clean_profile) bound to one
+    # target. profile "" = custom settings; no args + 0 min = plain launch. None = not
+    # chosen (Build button, git push): resolved from the project's defaults when
+    # the build runs. After it runs this holds what was actually launched.
+    # A target is a device id today. The same list is meant to grow other target
+    # kinds (an iOS simulator, a local macOS process) and several entries per
+    # target kind (e.g. 4 local clients for a multiplayer run), so keep entries
+    # self-describing and never assume one entry per build.
+    launches: Optional[list] = None
     # pid of the detached runner (app/runner.py) executing this build. It's a
     # session leader, so it is also the process group to signal on cancel.
     runner_pid: int = 0
@@ -599,6 +618,12 @@ async def run_build(build: Build, project: Project) -> None:
         build.build_number = str(bn) if bn else ""
         if floor and bn == floor:
             target_notes.append(f"build number bumped to {bn} so it installs over the device's build")
+    launch_plan_file = ""
+    if platform == "android" and build.deploy and transports:
+        build.launches = resolve_launch_plan(build, project, build.deployed_to)
+        save_active()
+        target_notes.extend(launch_plan_notes(build.launches))
+        launch_plan_file = write_launch_plan(out_dir, build.launches, build.deployed_to, transports)
     # Per-project parameters passed via env, never shell interpolation.
     env.update({
         "UBS_BUILD_ID": build.id,
@@ -627,6 +652,9 @@ async def run_build(build: Build, project: Project) -> None:
         "UBS_DEVICE_UDID": transports[0] if transports else "",
         "UBS_RECLAIM_DISK": "1" if project.reclaim_disk else "0",
         "UBS_UNINSTALL_ON_CONFLICT": "1" if project.uninstall_on_conflict else "0",
+        # Launch plan (Android): a TSV of "<adb serial>\t<keep-awake min>\t<args>",
+        # one line per target. build.sh looks up each serial when it launches the app.
+        "UBS_LAUNCH_PLAN": launch_plan_file,
         "UBS_CLEAN_IGNORED": "1" if project.clean_ignored else "0",
         "UBS_OUTPUT_DIR": str(out_dir),
         "UBS_XCODE_BUILD_DIR": str(out_dir / "xcode"),
@@ -940,6 +968,11 @@ def _require_ready(proj: Project) -> None:
 async def _startup() -> None:
     load_history()
     load_active()      # queue + the build that was running before the restart
+    try:
+        for note in LAUNCH_PROFILES.migrate_from(reg):
+            print(f"[launch profiles] {note}", flush=True)
+    except Exception as e:
+        print(f"[launch profiles] migration skipped: {e!r}", flush=True)
     asyncio.create_task(worker_loop())
     asyncio.create_task(hoststats.sampler(_build_pid))
     # A clone that was mid-download when the server stopped picks up where it
@@ -968,6 +1001,139 @@ def enqueue(project: Project, source: str, deploy: bool, coalesce: bool = False,
     QUEUE.append(b); _wakeup.set()
     save_active()
     return b
+
+
+LAUNCH_ARGS_MAX = 4000
+
+
+def _clean_launch_args(v) -> str:
+    """One line of launch args: newlines from the textarea become spaces."""
+    if v is None:
+        return ""
+    if not isinstance(v, str):
+        raise HTTPException(status_code=400, detail="launch args must be a string")
+    s = " ".join(v.split())
+    if len(s) > LAUNCH_ARGS_MAX:
+        raise HTTPException(status_code=400, detail=f"launch args longer than {LAUNCH_ARGS_MAX} characters")
+    return s
+
+
+def _clean_awake(v, default=0) -> int:
+    if v is None or v == "":
+        return default
+    try:
+        mins = int(str(v).strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="keep_awake_minutes must be a whole number of minutes")
+    if not 0 <= mins <= KEEP_AWAKE_MAX_MINUTES:
+        raise HTTPException(status_code=400,
+                            detail=f"keep_awake_minutes must be 0 (off) to {KEEP_AWAKE_MAX_MINUTES}")
+    return mins
+
+
+def _clean_profiles(lps) -> list:
+    """Validate a full shared profile list from the UI."""
+    if not isinstance(lps, list) or not all(isinstance(x, dict) for x in lps):
+        raise HTTPException(status_code=400, detail="profiles must be a list of launch profiles")
+    clean, seen = [], set()
+    for x in lps:
+        name = str(x.get("name") or "").strip()[:80]
+        if not name:
+            raise HTTPException(status_code=400, detail="every launch profile needs a name")
+        if name in seen:
+            raise HTTPException(status_code=400, detail=f"duplicate launch profile name: {name}")
+        seen.add(name)
+        clean.append(clean_profile({"name": name, "args": _clean_launch_args(x.get("args")),
+                                    "keep_awake_minutes": _clean_awake(x.get("keep_awake_minutes"))}))
+    return clean
+
+
+def _clean_launch_entry(x) -> dict:
+    """A plan entry from the UI. keep_awake_minutes absent = the profile's."""
+    if not isinstance(x, dict) or not x.get("target"):
+        raise HTTPException(status_code=400, detail="each launch needs a target")
+    e = {"target": str(x["target"]), "profile": str(x.get("profile") or "")[:80],
+         "args": _clean_launch_args(x.get("args"))}
+    if x.get("keep_awake_minutes") is not None:
+        e["keep_awake_minutes"] = _clean_awake(x["keep_awake_minutes"])
+    return e
+
+
+def apply_launch_choice(build: "Build", body: dict) -> None:
+    """Install / Build to… send {"launches": [{"target", "profile", "args",
+    "keep_awake_minutes"}, ...]}. Absent = the project's defaults at run time."""
+    if "launches" not in body:
+        return
+    if not isinstance(body["launches"], list):
+        raise HTTPException(status_code=400, detail="launches must be a list")
+    build.launches = [_clean_launch_entry(x) for x in body["launches"]]
+
+
+def _entry_for(profile: str, target: str, custom_args: str = "",
+               awake: Optional[int] = None) -> dict:
+    """A launch entry with the profile's settings copied in NOW, so the build
+    history shows exactly what ran even if the profile is edited later.
+    awake (if given) overrides the profile's keep-awake time."""
+    lp = LAUNCH_PROFILES.get(profile) if profile else None
+    if lp:
+        e = {"target": target, "profile": profile, "args": lp["args"],
+             "keep_awake_minutes": lp["keep_awake_minutes"]}
+    else:
+        e = {"target": target, "profile": profile, "args": custom_args, "keep_awake_minutes": 0}
+        if profile:
+            e["missing"] = True           # profile deleted since it was picked
+    if awake is not None:
+        e["keep_awake_minutes"] = awake
+    return e
+
+
+def resolve_launch_plan(build: "Build", project: Project, target_ids: list) -> list:
+    """The launches for the targets that are actually online. A plan picked in
+    the UI wins (targets it leaves out launch plainly); otherwise each target
+    gets its per-target default, else the project's default profile."""
+    if build.launches is not None:
+        picked = {}
+        for e in build.launches:
+            picked.setdefault(e["target"], e)
+        return [_entry_for(picked[t]["profile"], t, picked[t]["args"],
+                           picked[t].get("keep_awake_minutes")) if t in picked
+                else _entry_for("", t) for t in target_ids]
+    per_target = project.default_launches or {}
+    return [_entry_for(per_target.get(t, project.default_launch_profile), t) for t in target_ids]
+
+
+def launch_plan_notes(plan: list) -> list:
+    out = []
+    for e in plan:
+        who = _device_name(e["target"])
+        awake = e.get("keep_awake_minutes") or 0
+        bits = ([e["args"]] if e["args"] else []) + ([f"keep awake {awake} min"] if awake else [])
+        if e.get("missing"):
+            out.append(f"launch {who}: profile '{e['profile']}' no longer exists — plain launch"
+                       + (f", keep awake {awake} min" if awake else ""))
+        elif bits:
+            out.append(f"launch {who}: {e['profile'] or 'custom'} → {' · '.join(bits)}")
+    return out
+
+
+def write_launch_plan(out_dir: Path, plan: list, target_ids: list, transports: list) -> str:
+    """TSV for build.sh: transport<TAB>keep-awake minutes<TAB>args. Args never
+    hold tabs/newlines (_clean_launch_args collapses whitespace)."""
+    by_target = {e["target"]: e for e in plan}
+    lines = []
+    for tid, tr in zip(target_ids, transports):
+        e = by_target.get(tid)
+        if not e:
+            continue
+        args = "" if e.get("missing") else e["args"]
+        awake = int(e.get("keep_awake_minutes") or 0)
+        if args or awake:
+            lines.append(f"{tr}\t{awake}\t{args}")
+    if not lines:
+        return ""
+    path = out_dir / "launch-plan.tsv"
+    path.write_text("\n".join(lines) + "\n")
+    return str(path)
 
 
 async def _json_body(request: Request) -> dict:
@@ -1137,10 +1303,26 @@ async def api_edit(project_id: str, request: Request, x_build_token: str = Heade
                "merge_from", "auto_distribute",
                "platform", "android_build_aab", "keystore_path", "keystore_alias",
                "target_kinds", "deploy_devices",
-               "bump_version_from_devices", "uninstall_on_conflict"}
+               "bump_version_from_devices", "uninstall_on_conflict",
+               "default_launch_profile", "default_launches"}
     fields = {k: v for k, v in body.items() if k in allowed}
     if "platform" in fields:
         fields["platform"] = _check_platform(fields["platform"])
+    names = {x["name"] for x in LAUNCH_PROFILES.all()}
+    if "default_launch_profile" in fields:
+        d = str(fields["default_launch_profile"] or "")
+        if d and d not in names:
+            raise HTTPException(status_code=400, detail=f"no launch profile named {d!r}")
+        fields["default_launch_profile"] = d
+    if "default_launches" in fields:
+        dl = fields["default_launches"]
+        if not isinstance(dl, dict):
+            raise HTTPException(status_code=400, detail="default_launches must be {target: profile}")
+        # "" = this target launches plainly even if the project has a default.
+        bad = [v for v in dl.values() if v and v not in names]
+        if bad:
+            raise HTTPException(status_code=400, detail=f"no launch profile named {bad[0]!r}")
+        fields["default_launches"] = {str(k): str(v or "") for k, v in dl.items()}
     cur = reg.get(project_id)
     if not cur:
         raise HTTPException(status_code=404, detail="no such project")
@@ -1159,6 +1341,36 @@ async def api_edit(project_id: str, request: Request, x_build_token: str = Heade
         REPO_STATUS.pop(project_id, None)      # compared against the wrong branches now
         schedule_repo_status(project_id, force=True)
     return proj.public()
+
+
+@app.get("/api/launch-profiles")
+async def api_launch_profiles():
+    """The shared launch-profile library."""
+    return {"profiles": LAUNCH_PROFILES.all()}
+
+
+@app.put("/api/launch-profiles")
+async def api_set_launch_profiles(request: Request, x_build_token: str = Header(default="")):
+    """Replace the whole shared library: {"profiles": [{"name", "args"}]}.
+    Project defaults that pointed at a removed profile are cleared."""
+    _check_token(x_build_token)
+    body = await _json_body(request)
+    profiles = _clean_profiles(body.get("profiles"))
+    try:
+        LAUNCH_PROFILES.replace(profiles)
+    except RegistryWriteError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    names = {x["name"] for x in profiles}
+    for p in reg.list():
+        upd = {}
+        if p.default_launch_profile and p.default_launch_profile not in names:
+            upd["default_launch_profile"] = ""
+        dl = p.default_launches or {}
+        if any(v and v not in names for v in dl.values()):
+            upd["default_launches"] = {k: v for k, v in dl.items() if not v or v in names}
+        if upd:
+            reg.update(p.id, **upd)
+    return {"profiles": profiles}
 
 
 @app.get("/api/projects/{project_id}/branches")
@@ -1391,7 +1603,10 @@ async def trigger_build(project_id: str, request: Request, x_build_token: str = 
     # Optional body {"devices": [...]} — "Build to…" in the UI. Omitted = defaults.
     body = await _json_body(request)
     devs = validate_device_ids(proj, body.get("devices"))
-    return JSONResponse(enqueue(proj, "phone", do_deploy, devices=devs).public())
+    b = enqueue(proj, "phone", do_deploy, devices=devs)
+    apply_launch_choice(b, body)   # Build to… may pick launch args; else the default
+    save_active()
+    return JSONResponse(b.public())
 
 
 @app.post("/cancel/{build_id}")
@@ -2498,6 +2713,7 @@ async def install_artifact(project_id: str, build_id: str, request: Request,
     # Enqueue a lightweight install-only build; the script sees UBS_INSTALL_ONLY.
     nb = enqueue(proj, "install", True, devices=devs)
     nb.artifact = b.artifact
+    apply_launch_choice(nb, body)
     save_active()
     return JSONResponse(nb.public())
 

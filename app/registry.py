@@ -81,6 +81,25 @@ class Project:
     #   signing key), uninstall the app and reinstall. WIPES the app's data.
     bump_version_from_devices: bool = True
     uninstall_on_conflict: bool = False
+    # LEGACY: the per-project keep-awake switch. Keep-awake is now part of the
+    # launch config (a launch profile / launch plan entry); these are folded in
+    # at startup by LaunchProfiles.migrate_from and then switched off.
+    keep_awake_after_deploy: bool = False
+    keep_awake_minutes: int = 10
+    # Android launch arguments. After an install the app is started with
+    # `am start -e unity "<args>"`, which Unity hands to the player as its
+    # command line. The saved argument sets ("launch profiles") are SHARED by
+    # every project (LaunchProfiles below); a project only picks its default:
+    # the profile name used by Build, git-push deploys and preselected in the
+    # Install dialog ("" = launch with no args).
+    default_launch_profile: str = ""
+    # Per-target overrides of that default, {device id: profile name} ("" =
+    # launch that target plainly). Keyed by target id so other target kinds
+    # (simulators, local processes) can slot in later.
+    default_launches: dict = field(default_factory=dict)
+    # LEGACY: per-project profiles from before they were shared. Moved into the
+    # shared list at startup (LaunchProfiles.migrate_from) and then cleared.
+    launch_profiles: list = field(default_factory=list)
     # behaviour
     webhook_deploys: bool = False       # does a git push also install to phone?
     reclaim_disk: bool = True           # uninstall other editor versions when installing
@@ -137,6 +156,11 @@ class Project:
                     "enabled": bool(s.get("enabled", True)),
                 })
         self.pre_build_steps = norm
+        self.launch_profiles = [
+            {"name": str(lp.get("name", "")).strip(), "args": str(lp.get("args", ""))}
+            for lp in (self.launch_profiles or []) if isinstance(lp, dict)
+        ]
+
 
     def public(self) -> dict:
         return asdict(self)
@@ -147,6 +171,117 @@ class Project:
         for keys added in later versions (so old projects.json files still load)."""
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in rec.items() if k in known})
+
+
+def clean_profile(x: dict) -> dict:
+    """A launch profile: how to START the app on a target — not how it's built.
+      name                the label projects and launch plans refer to
+      args                command-line args (Android: `am start -e unity "<args>"`)
+      keep_awake_minutes  0 = off; else keep the device awake that long after
+                          launch (Quest: proximity override; varies by device)
+    New launch settings belong here, so every target kind (devices today,
+    simulators / local processes later) gets them the same way."""
+    try:
+        mins = max(0, int(x.get("keep_awake_minutes") or 0))
+    except (TypeError, ValueError):
+        mins = 0
+    return {"name": str(x.get("name", "")), "args": str(x.get("args", "")),
+            "keep_awake_minutes": mins}
+
+
+class LaunchProfiles:
+    """The shared launch-profile library (see clean_profile), one JSON file next
+    to projects.json. Every project picks its default from this list."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+
+    def all(self) -> list:
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return []
+        return [clean_profile(x) for x in data if isinstance(x, dict)] if isinstance(data, list) else []
+
+    def get(self, name: str) -> Optional[dict]:
+        return next((x for x in self.all() if x["name"] == name), None)
+
+    def replace(self, profiles: list) -> list:
+        with self._lock:
+            self._write(profiles)
+        return profiles
+
+    def _write(self, profiles: list) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        try:
+            with open(tmp, "w") as f:
+                json.dump(profiles, f, indent=2)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            raise RegistryWriteError(f"couldn't save launch profiles to {self.path}: {e}") from e
+
+    def migrate_from(self, registry: "Registry") -> list:
+        """Move any per-project profiles (older records) into the shared list.
+        Same name + same args = one profile; same name + different args keeps
+        both, the second renamed "<name> (<project>)" (and that project's
+        default follows the rename). Returns notes for the server log."""
+        notes = []
+        with self._lock:
+            shared = self.all()
+            changed = False
+            for proj in registry.list():
+                if not proj.launch_profiles:
+                    continue
+                dflt = proj.default_launch_profile
+                for lp in proj.launch_profiles:
+                    name = lp["name"]
+                    if not name:
+                        continue
+                    have = next((x for x in shared if x["name"] == name), None)
+                    if have and have["args"] == lp["args"]:
+                        continue
+                    if have:
+                        new = f"{name} ({proj.name})"
+                        notes.append(f"launch profile '{name}' of {proj.name} differs from the shared one; kept as '{new}'")
+                        if dflt == name:
+                            dflt = new
+                        name = new
+                    shared.append(clean_profile({"name": name, "args": lp["args"]}))
+                    changed = True
+                if changed:
+                    self._write(shared)
+                registry.update(proj.id, launch_profiles=[], default_launch_profile=dflt)
+                notes.append(f"moved {proj.name}'s launch profiles into the shared list")
+            # Per-project keep-awake -> launch config. The project's default
+            # profile gets the keep-awake time (if it had none); with no default
+            # profile, a shared "Keep awake" profile (no args) becomes its default.
+            for proj in registry.list():
+                if not proj.keep_awake_after_deploy:
+                    continue
+                mins = max(1, int(proj.keep_awake_minutes or 10))
+                dflt = proj.default_launch_profile
+                prof = next((x for x in shared if x["name"] == dflt), None) if dflt else None
+                if prof is None:
+                    dflt = "Keep awake"
+                    prof = next((x for x in shared if x["name"] == dflt), None)
+                    if prof is None:
+                        prof = clean_profile({"name": dflt, "args": ""})
+                        shared.append(prof)
+                if not prof["keep_awake_minutes"]:
+                    prof["keep_awake_minutes"] = mins
+                self._write(shared)
+                registry.update(proj.id, keep_awake_after_deploy=False, default_launch_profile=dflt)
+                notes.append(f"{proj.name}: keep-awake is now part of launch profile '{dflt}' "
+                             f"({prof['keep_awake_minutes']} min)")
+        return notes
 
 
 class Registry:
